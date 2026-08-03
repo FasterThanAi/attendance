@@ -8,8 +8,9 @@ the parent folder) for the full 11-phase engineering plan this repo follows.
 
 This repo currently implements **Phase 0 (Foundations and consent)**,
 **Phase 1 (Enrollment and gallery construction)**,
-**Phase 2 (Upload and orchestration)**, and
-**Phase 3 (Frames and detection)**.
+**Phase 2 (Upload and orchestration)**,
+**Phase 3 (Frames and detection)**, and
+**Phase 4 (Quality gate and alignment)**.
 
 ## What's here
 
@@ -35,13 +36,18 @@ attend/
                             plus Phase 3's tiled path (compute_tile_grid,
                             non_max_suppression, detect_faces_tiled,
                             detect_all_frames -> detections.parquet)
-      align.py              5-point ArcFace alignment to 112x112
-      quality.py            blur/brightness/yaw/pitch (Phase 1 subset; Phase 4
-                            adds the full tunable-weight composite gate)
+      align.py              5-point ArcFace alignment to 112x112 (Phase 1's
+                            align_face); Phase 4's align_crops batches this
+                            over a whole video into aligned.npy (memmap) +
+                            aligned_index.parquet
+      quality.py            Phase 1's per-crop blur/brightness/yaw/pitch
+                            helpers, plus Phase 4's score_detections (the
+                            full tunable-weight composite gate + accept/
+                            reject rules over a whole detections.parquet)
       embed.py              ArcFace r100 embedding via onnxruntime
-      run.py                orchestrator -- extract/detect are now REAL
-                            (Phase 3); quality/align/embed/cluster/match
-                            still stubs (Phases 4-6)
+      run.py                orchestrator -- extract/detect (Phase 3) and
+                            quality/align (Phase 4) are now REAL;
+                            embed/cluster/match still stubs (Phases 5-6)
       cluster.py, match.py  still stubs (Phases 5-6)
     db.py                  worker's own sync DB access (reflects tables live --
                           see its docstring for why this isn't shared with api)
@@ -58,6 +64,10 @@ attend/
     draw_detections.py     Phase 3: draws detection boxes + face_width_px
                           onto sampled frames from a job's detections.parquet,
                           so you can eyeball tiling/NMS/coverage
+    contact_sheet.py        Phase 4: grid image of N accepted + N rejected
+                          crops (labelled with quality score / reject_reason)
+                          from a job's quality.parquet, to eyeball whether
+                          the quality gate is calibrated sensibly
 ```
 
 ## How to verify (Mac)
@@ -261,7 +271,16 @@ cd apps/web && npm install && cp .env.local.example .env.local && npm run dev
   it (plus `settings.insightface_home` as the model directory) into
   `run_all_stages`, which now raises loudly if either stage needs to run but
   wasn't given a `video_path`/`model_dir` (rather than silently doing
-  nothing). `quality`, `align`, `embed`, `cluster`, `match` are still stubs.
+  nothing).
+- **Gap found and fixed while building Phase 4**: the roadmap's own
+  detections.parquet column spec includes `tile_origin_x`/`tile_origin_y`,
+  which the original Phase 3 build omitted. Added a `tile_origin` field to
+  `Detection`, set on tile-pass detections and left `None` (written as a
+  `-1` sentinel) on whole-frame-pass detections. Also hardened
+  `detect_all_frames` to always write the full column schema even when a
+  video produces zero detections (previously `pd.DataFrame([])` had no
+  columns at all, which would have broken Phase 4's `quality` stage on a
+  genuinely faceless video).
 
 ## Phase 3: how to verify
 
@@ -299,12 +318,105 @@ worker processes), and the parquet write/read round-trip with real pandas
 (pandas import itself works in my sandbox, but I haven't run
 `detect_all_frames` end-to-end against real frames).
 
-## Next: Phase 4
+## Phase 4: what's new
 
-Quality gate and alignment, wired into `run.py`'s `quality`/`align` stages
-for classroom video (both already exist and are proven correct for
-enrollment's use in Phase 1 -- Phase 4 is about applying them to the
-`detections.parquet` this phase produces, plus building the full
-tunable-weight composite quality score the roadmap describes, beyond
-Phase 1's simpler `simple_quality_score`). Say "start phase 4" when Phase 3
-is verified on your machine.
+- `pipeline/params.py` -- 3 new composite-quality-score weight fields:
+  `quality_weight_size` (0.4), `quality_weight_blur` (0.3),
+  `quality_weight_frontality` (0.3). Added to `run.py`'s
+  `STAGE_PARAM_FIELDS["quality"]` and api's `DEFAULT_PIPELINE_PARAMS` too --
+  verified programmatically that `PipelineParams` and `DEFAULT_PIPELINE_PARAMS`
+  still have exactly matching field sets.
+- `pipeline/quality.py` -- the actual quality-gate deliverable:
+  - `composite_quality_score(face_width_px, blur, yaw_deg, pitch_deg, params)`
+    -- a WEIGHTED combination of normalised size/blur/frontality (frontality
+    considers both yaw and pitch, each normalised against its own
+    accept/reject bound, unlike Phase 1's yaw-only `simple_quality_score`,
+    which now shares the same `FACE_WIDTH_NORM_PX`/`BLUR_NORM` constants so
+    the two scoring functions can't silently drift apart).
+  - `score_detections(detections_df, frame_dir, params) -> QualityResult` --
+    for every detection: crop it out of its source frame (frames cached per
+    `frame_index`, not re-read per detection), compute blur/brightness/pose/
+    composite score, and apply the 6-rule reject gate from the roadmap
+    (`low_detector_score`, `too_small`, `too_blurred`, `yaw_too_extreme`,
+    `pitch_too_extreme`, `bad_brightness`, plus an `invalid_crop` rule of my
+    own for a bbox that falls outside the frame). Every row is kept,
+    rejected or not, with a `reject_reason` -- per the prompt, "Phase 7
+    needs to analyse what was thrown away."
+  - `run_quality_stage(...)` -- I/O wrapper: reads `detections.parquet`,
+    writes `quality.parquet`, logs accepted/rejected counts by reason plus
+    the accepted-crop score distribution.
+- `pipeline/align.py` -- `align_crops(accepted_df, frame_dir, out_dir, params)
+  -> AlignedSet`: aligns every accepted crop via the same `align_face` Phase 1
+  already proved correct, writes `aligned.npy` as a single self-describing
+  `(N, 112, 112, 3)` uint8 memmap (via `np.lib.format.open_memmap`, so later
+  phases can `np.load(path, mmap_mode="r")` without needing N/dtype/shape
+  passed separately) and `aligned_index.parquet` mapping each row back to
+  `det_id`/`frame_index`/`quality_score`. `run_align_stage(...)` is the I/O
+  wrapper `run.py` actually calls.
+- `pipeline/run.py` -- `quality` and `align` are now REAL stages too. Neither
+  needs `video_path`/`model_dir`; they just read the previous stage's output
+  straight off the filesystem (`job_dir/detect/detections.parquet`,
+  `job_dir/quality/quality.parquet`), the same convention every stage here
+  follows.
+- `eval/scripts/contact_sheet.py` -- Phase 4's own definition of done,
+  verbatim: "manually inspecting 30 accepted and 30 rejected crops confirms
+  the gate is making sensible calls." This script samples 30+30 by default,
+  crops them from the source frames, and writes one labelled grid image.
+- **Gap found and fixed from Phase 3** (see above): `tile_origin_x`/
+  `tile_origin_y` columns were missing from `detections.parquet`; also
+  hardened `detect_all_frames` against a zero-detection video producing a
+  columnless (and thus downstream-breaking) DataFrame.
+
+## Phase 4: how to verify
+
+```bash
+docker-compose up --build
+
+docker-compose exec worker pytest -v tests/test_quality_gate.py tests/test_align_crops.py tests/test_run.py
+```
+
+Expected: `test_quality_gate.py` (each of the 6 reject rules fires on a
+crafted input, rejected rows are kept not dropped, blur is scale-invariant
+across two crop sizes, composite score weighting), `test_align_crops.py`
+(memmap shape/dtype, byte-identical to `align_face`'s own output, index
+parquet mapping, empty-input handling), and `test_run.py` (still-correct
+hash-invalidation cascade with quality/align now real) all pass.
+
+I ran the equivalent logic directly in my sandbox: real numpy/opencv/pandas
+for the quality-gate and alignment tests (all 15 pass against real synthetic
+JPEGs and landmark geometry, no mocking needed since `score_detections`
+doesn't touch parquet itself). For anything touching actual parquet
+read/write (`align_crops`'s index file, `run_quality_stage`,
+`run_align_stage`, and `test_run.py`'s full stage loop with quality/align
+now real), I don't have pyarrow installed here (no PyPI access, same as
+every prior phase) -- I verified the LOGIC by temporarily swapping
+`DataFrame.to_parquet`/`pd.read_parquet` for a pickle-based equivalent in my
+own verification harness only (never in the shipped code, which still calls
+real `to_parquet`/`read_parquet` throughout) and confirmed all of it: the
+memmap's row 0 is byte-identical to `align_face` run on the same re-read
+(post-JPEG) frame, the index parquet correctly maps row index to `det_id`,
+an all-rejected video produces a clean 0-crop `aligned.npy` instead of
+crashing, and the full `run_all_stages` loop (extract/detect faked, quality/
+align real) still passes all 6 orchestration tests. I also re-ran every
+Phase 1-3 worker test to confirm nothing regressed: `test_align` (1),
+`test_pose` (11), `test_quality` (3), `test_embed` (3), `test_detect_tiling`
+(7) -- 25 tests, all still pass alongside Phase 4's new `test_quality_gate`
+(13) and `test_align_crops` (2).
+
+What I could NOT verify: real parquet I/O with actual pyarrow (needs your
+Mac's `pip install -r requirements.txt`), and manually inspecting real
+accepted/rejected crops from real classroom footage --
+`contact_sheet.py` is exactly the tool for that once you have a real job to
+point it at. Also worth checking on your end: the roadmap's expectation that
+70-80% of detections get rejected and 3000-6000 crops survive from a
+90-student video -- I have no real footage to check those numbers against.
+
+## Next: Phase 5
+
+Embedding and clustering -- the intellectual core of the project. Each
+aligned crop becomes a 512-dim ArcFace vector (embed.py already exists from
+Phase 1); DBSCAN groups them into identities without knowing the headcount
+in advance, then a temporal-coherence pass (already documented in
+`cluster_merge_distance_factor`) merges clusters that are close in vector
+space AND overlap in time. Say "start phase 5" when Phase 4 is verified on
+your machine.

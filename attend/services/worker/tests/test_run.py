@@ -3,19 +3,22 @@
 which touches only the filesystem (a tmp_path), never a database -- see its
 docstring for why that split exists.
 
-Phase 3 made 'extract' and 'detect' real (ffmpeg / SCRFD) instead of stubs,
-so tests exercising the FULL stage loop now monkeypatch
-pipeline.run.extract_frames and pipeline.run.detect_all_frames with fakes --
+Phase 3 made 'extract' and 'detect' real (ffmpeg / SCRFD) instead of stubs;
+Phase 4 made 'quality' and 'align' real too. Tests exercising the FULL stage
+loop monkeypatch pipeline.run.extract_frames and
+pipeline.run.detect_all_frames with fakes (quality/align are left REAL,
+since they're cheap pandas/numpy operations over whatever detect wrote --
 this file is about orchestration logic (hashing, skip-if-complete), not
 about whether ffmpeg or a real detector model works, which needs Mac-side
 Docker with real media/models anyway.
 """
 
+import pandas as pd
+import pytest
 from dataclasses import replace
 from pathlib import Path
 
-import pytest
-
+from pipeline.detect import DETECTION_COLUMNS
 from pipeline.extract import FrameManifest
 from pipeline.params import PipelineParams
 from pipeline.run import STAGE_ORDER, compute_stage_hashes, is_stage_complete, run_all_stages
@@ -26,7 +29,12 @@ def _fake_extract_and_detect(monkeypatch):
     """Every run_all_stages call in this file goes through the full stage
     loop, including 'extract'/'detect' -- fake both out so tests don't need
     a real video file or a real ONNX model directory, only what's under
-    test here: the orchestration/caching logic around them.
+    test here: the orchestration/caching logic around them. 'quality'/
+    'align' are left real (Phase 4): fake_detect_all_frames writes a
+    correctly-shaped but EMPTY detections.parquet (0 rows, full column
+    schema -- see DETECTION_COLUMNS), so the real quality/align stages run
+    against a genuinely empty, faceless "video" and produce a clean 0-crop
+    result instead of erroring on a missing/malformed file.
     """
 
     def fake_extract_frames(video_path, out_dir, fps):
@@ -44,6 +52,7 @@ def _fake_extract_and_detect(monkeypatch):
 
     def fake_detect_all_frames(frame_dir, out_dir, params, model_dir, fps):
         out_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(columns=DETECTION_COLUMNS).to_parquet(out_dir / "detections.parquet")
         return _FakeDetectionSummary()
 
     monkeypatch.setattr("pipeline.run.extract_frames", fake_extract_frames)

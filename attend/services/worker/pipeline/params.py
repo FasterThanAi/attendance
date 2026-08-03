@@ -62,6 +62,18 @@ class PipelineParams:
     brightness_min: float = 40.0
     brightness_max: float = 215.0
 
+    # --- composite quality score weights (Phase 4) ---
+    # Phase 4's score_detections combines three normalised 0..1 sub-scores
+    # (face size, blur, frontality) into one composite score via a weighted
+    # mean -- these are the weights, made tunable per the Phase 4 prompt
+    # ("make the weights fields on PipelineParams"). They're expected to sum
+    # to 1.0 but this isn't enforced; a caller who wants an un-normalised
+    # emphasis can set them otherwise; the composite score just won't land
+    # in a clean 0..1 range if they don't sum to 1.
+    quality_weight_size: float = 0.4
+    quality_weight_blur: float = 0.3
+    quality_weight_frontality: float = 0.3
+
     # --- pose bucketing (enrollment only, Phase 1) ---
     # A frame's yaw below -enrollment_pose_split_deg is "left", above
     # +enrollment_pose_split_deg is "right", otherwise "frontal". This is a

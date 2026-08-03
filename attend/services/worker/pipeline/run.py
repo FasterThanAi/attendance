@@ -1,5 +1,5 @@
-"""Job orchestration (Phase 2 deliverable 3-4; Phase 3 wires in real
-extract/detect stages).
+"""Job orchestration (Phase 2 deliverable 3-4; Phase 3 wired in real
+extract/detect; Phase 4 wires in real quality/align).
 
 `process_session` is the single RQ entrypoint for the classroom-video
 pipeline. It runs each stage in order, skipping any stage whose on-disk
@@ -10,11 +10,11 @@ on any exception (rule: "a job that fails visibly is far better than a job
 that quietly marks students absent").
 
 Per the Phase 2 prompt, ALL stages started as stubs (log + write an empty
-manifest). Phase 3 replaces exactly two of them -- extract and detect --
-with real implementations (pipeline.extract.extract_frames and
-pipeline.detect.detect_all_frames); quality/align/embed/cluster/match stay
-stubs until Phases 4-6, one at a time, so it's always clear from this file
-which phase delivered which stage.
+manifest). Phase 3 replaced extract/detect; Phase 4 replaces quality/align
+with real implementations (pipeline.quality.run_quality_stage and
+pipeline.align.run_align_stage); embed/cluster/match stay stubs until
+Phases 5-6, one at a time, so it's always clear from this file which phase
+delivered which stage.
 """
 
 from __future__ import annotations
@@ -32,9 +32,11 @@ from sqlalchemy import select, update
 
 from config import settings
 from db import get_engine, table
+from pipeline.align import run_align_stage
 from pipeline.detect import detect_all_frames
 from pipeline.extract import extract_frames
 from pipeline.params import PipelineParams
+from pipeline.quality import run_quality_stage
 
 logger = logging.getLogger("attend.worker.run")
 
@@ -51,7 +53,11 @@ STAGE_PARAM_FIELDS: dict[str, list[str]] = {
         "detector_score_min", "tile_trigger_long_side_px", "tile_size_px",
         "tile_overlap_px", "nms_iou_threshold",
     ],
-    "quality": ["min_face_px", "max_abs_yaw_deg", "max_abs_pitch_deg", "blur_laplacian_min", "brightness_min", "brightness_max"],
+    "quality": [
+        "min_face_px", "max_abs_yaw_deg", "max_abs_pitch_deg", "blur_laplacian_min",
+        "brightness_min", "brightness_max",
+        "quality_weight_size", "quality_weight_blur", "quality_weight_frontality",
+    ],
     "align": ["embed_input_size"],
     "embed": ["embed_batch_size"],
     "cluster": ["cluster_eps", "cluster_min_samples", "cluster_merge_distance_factor", "temporal_coherence_enabled"],
@@ -115,9 +121,8 @@ def write_stage_manifest(stage_dir: Path, stage: str, params_hash: str, item_cou
 
 
 def _run_stub_stage(stage: str, stage_dir: Path, job_id: int) -> int:
-    """Phase 2's stub, still used for quality/align/embed/cluster/match until
-    Phases 4-6 replace them one at a time -- see _run_real_stage below for
-    the pattern each of those will follow.
+    """Phase 2's stub, still used for embed/cluster/match until Phases 5-6
+    replace them one at a time.
     """
     logger.info("job %s: stage '%s' running (stub)", job_id, stage)
     stage_dir.mkdir(parents=True, exist_ok=True)
@@ -141,6 +146,23 @@ def _run_detect_stage(stage_dir: Path, frame_dir: Path, params: PipelineParams, 
     return summary.total_detections
 
 
+def _run_quality_stage(stage_dir: Path, detections_parquet: Path, frame_dir: Path, params: PipelineParams, job_id: int) -> int:
+    logger.info("job %s: stage 'quality' running (detections=%s)", job_id, detections_parquet)
+    summary = run_quality_stage(detections_parquet, frame_dir, stage_dir, params)
+    logger.info(
+        "job %s: stage 'quality' done -- %s input, %s accepted, %s rejected (%s)",
+        job_id, summary.input_count, summary.accepted_count, summary.rejected_count, summary.reject_reason_counts,
+    )
+    return summary.accepted_count
+
+
+def _run_align_stage(stage_dir: Path, quality_parquet: Path, frame_dir: Path, params: PipelineParams, job_id: int) -> int:
+    logger.info("job %s: stage 'align' running (quality=%s)", job_id, quality_parquet)
+    result = run_align_stage(quality_parquet, frame_dir, stage_dir, params)
+    logger.info("job %s: stage 'align' done -- %s crop(s) aligned", job_id, result.count)
+    return result.count
+
+
 def run_all_stages(
     job_dir: Path,
     params: PipelineParams,
@@ -150,10 +172,15 @@ def run_all_stages(
     model_dir: Path | None = None,
 ) -> None:
     """The actual stage loop: no database, no RQ, no network -- just the
-    filesystem under `job_dir`, `params`, and (for the two real Phase 3
-    stages) `video_path`/`model_dir`. Independently testable per
-    non-negotiable rule #1; `process_session` below is a thin DB-aware
-    wrapper around this.
+    filesystem under `job_dir`, `params`, and (for extract/detect only)
+    `video_path`/`model_dir`. Independently testable per non-negotiable
+    rule #1; `process_session` below is a thin DB-aware wrapper around this.
+
+    quality/align (Phase 4) need no extra arguments beyond `job_dir` --
+    they read detect's/quality's own output straight from the filesystem
+    (`job_dir/detect/detections.parquet`, `job_dir/quality/quality.parquet`),
+    the same convention every stage here follows: read the previous stage's
+    directory, write your own.
 
     `video_path`/`model_dir` are only required if the 'extract'/'detect'
     stages actually need to run (i.e. aren't already cached) -- tests that
@@ -183,6 +210,14 @@ def run_all_stages(
             if model_dir is None:
                 raise ValueError("run_all_stages: 'detect' stage needs model_dir, none given")
             item_count = _run_detect_stage(stage_dir, job_dir / "extract", params, model_dir, job_id)
+        elif stage == "quality":
+            item_count = _run_quality_stage(
+                stage_dir, job_dir / "detect" / "detections.parquet", job_dir / "extract", params, job_id
+            )
+        elif stage == "align":
+            item_count = _run_align_stage(
+                stage_dir, job_dir / "quality" / "quality.parquet", job_dir / "extract", params, job_id
+            )
         else:
             item_count = _run_stub_stage(stage, stage_dir, job_id)
 

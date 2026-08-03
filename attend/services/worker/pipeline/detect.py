@@ -41,6 +41,12 @@ class Detection:
     # 5 landmarks in (x, y) order: left eye, right eye, nose, left mouth
     # corner, right mouth corner -- the standard insightface/ArcFace ordering.
     landmarks: tuple[tuple[float, float], ...]
+    # Which tile (if any) this detection came from, in frame pixel coords
+    # (x0, y0) -- None means it came from the whole-frame-downscaled pass,
+    # not a tile. Per the Phase 3 spec's detections.parquet column list
+    # (tile_origin_x, tile_origin_y); defaults to None so Phase 1's
+    # non-tiled detect_faces() call sites don't need to change.
+    tile_origin: tuple[int, int] | None = None
 
     @property
     def face_width_px(self) -> float:
@@ -238,6 +244,7 @@ def detect_faces_tiled(image_bgr: np.ndarray, model: DetectorModel, params: Pipe
                     x1=d.x1 + x0, y1=d.y1 + y0, x2=d.x2 + x0, y2=d.y2 + y0,
                     score=d.score,
                     landmarks=tuple((lx + x0, ly + y0) for lx, ly in d.landmarks),
+                    tile_origin=(x0, y0),
                 ))
 
         scale = params.tile_size_px / long_side
@@ -259,6 +266,20 @@ def detect_faces_tiled(image_bgr: np.ndarray, model: DetectorModel, params: Pipe
 # Batch detection over a whole video's extracted frames (Phase 3 deliverable
 # 2-3): multiprocessing, one detector load per worker process, parquet output
 # --------------------------------------------------------------------------
+
+# Full detections.parquet schema, used to guarantee a correctly-shaped
+# (if empty) DataFrame even when a video produces literally zero
+# detections in every frame -- without this, `pd.DataFrame([])` has NO
+# columns at all, and Phase 4's quality stage (which does
+# `detections_df.groupby("frame_index")` and expects an `x1`/`score`/etc.
+# column to exist even on a 0-row input) would KeyError on a genuinely
+# faceless video instead of producing a clean "0 accepted" result.
+DETECTION_COLUMNS = (
+    ["frame_index", "frame_timestamp_s", "det_id", "x1", "y1", "x2", "y2", "score", "face_width_px"]
+    + [f"lmk_x{i}" for i in range(1, 6)]
+    + [f"lmk_y{i}" for i in range(1, 6)]
+    + ["tile_origin_x", "tile_origin_y"]
+)
 
 _worker_model_dir: Path | None = None
 
@@ -286,6 +307,15 @@ def _detect_one_frame(task: tuple[int, str, float, PipelineParams]) -> list[dict
 
     rows = []
     for det_index, d in enumerate(detect_faces_tiled(image, model, params)):
+        # tile_origin_x/y: -1 sentinel means this surviving detection came
+        # from the whole-frame-downscaled pass, not a tile (see
+        # detect_faces_tiled). When NMS merges a tile detection and a
+        # whole-frame detection of the same face, whichever had the higher
+        # score is the one whose tile_origin (or lack of one) survives here
+        # -- this column is a debugging aid (see draw_detections.py), not a
+        # guarantee that tiling "found" every face on its own.
+        tile_origin_x = d.tile_origin[0] if d.tile_origin is not None else -1
+        tile_origin_y = d.tile_origin[1] if d.tile_origin is not None else -1
         row = {
             "frame_index": frame_index,
             "frame_timestamp_s": frame_index / fps if fps > 0 else 0.0,
@@ -293,6 +323,8 @@ def _detect_one_frame(task: tuple[int, str, float, PipelineParams]) -> list[dict
             "x1": d.x1, "y1": d.y1, "x2": d.x2, "y2": d.y2,
             "score": d.score,
             "face_width_px": d.face_width_px,
+            "tile_origin_x": tile_origin_x,
+            "tile_origin_y": tile_origin_y,
         }
         for i, (lx, ly) in enumerate(d.landmarks):
             row[f"lmk_x{i + 1}"] = lx
@@ -323,7 +355,9 @@ def detect_all_frames(
     multiprocessing Pool sized min(cpu_count, 4) (Phase 3 prompt), and writes
     one row per detection to `out_dir`/detections.parquet with columns:
     frame_index, frame_timestamp_s, det_id, x1, y1, x2, y2, score,
-    lmk_x1..lmk_x5, lmk_y1..lmk_y5, face_width_px.
+    lmk_x1..lmk_x5, lmk_y1..lmk_y5, face_width_px, tile_origin_x,
+    tile_origin_y (per the Phase 3 spec's column list; -1 sentinel on the
+    latter two means "came from the whole-frame pass, not a tile").
 
     No crops are produced here -- that's Phase 4's job (align.py already
     exists from Phase 1's enrollment use; wiring it into the classroom
@@ -344,7 +378,8 @@ def detect_all_frames(
 
     out_dir.mkdir(parents=True, exist_ok=True)
     parquet_path = out_dir / "detections.parquet"
-    pd.DataFrame(all_rows).to_parquet(parquet_path)
+    detections_df = pd.DataFrame(all_rows) if all_rows else pd.DataFrame(columns=DETECTION_COLUMNS)
+    detections_df.to_parquet(parquet_path)
 
     counts = [len(rows) for rows in per_frame_rows]
     widths = [row["face_width_px"] for row in all_rows]
