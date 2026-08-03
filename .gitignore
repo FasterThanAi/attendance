@@ -1,0 +1,36 @@
+# Environment & Credentials (NEVER commit to git)
+.env
+*.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Python cache & build outputs
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Node.js
+node_modules/
+.next/
+
+# OS metadata & data logs
+.DS_Store
+/data/
+*.db
+*.sqlite3
+eval/golden/*.mp4
+eval/golden/*.mov

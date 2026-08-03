@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+node_modules/
+.next/
+/data/
+*.db
+*.sqlite3
+eval/golden/*.mp4
+eval/golden/*.mov
+.DS_Store

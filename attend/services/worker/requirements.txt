@@ -1,0 +1,11 @@
+# Phase 0: just enough to run an RQ worker process and connect to Redis/Postgres.
+# ML dependencies (insightface, onnxruntime, opencv-python-headless, scikit-learn)
+# are added in Phase 3-5 when the pipeline stages are implemented -- pinning them
+# now with no code using them yet would just slow down every rebuild.
+redis==5.0.8
+rq==1.16.2
+sqlalchemy[asyncio]==2.0.35
+asyncpg==0.29.0
+pydantic==2.9.2
+pydantic-settings==2.5.2
+boto3==1.35.24
