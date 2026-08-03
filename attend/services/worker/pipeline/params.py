@@ -104,6 +104,24 @@ class PipelineParams:
     # substantially -- see Phase 5's temporal-coherence post-pass.
     cluster_merge_distance_factor: float = 1.3
     temporal_coherence_enabled: bool = True
+    # ASSUMPTION: the roadmap says two clusters' frame ranges must "overlap
+    # substantially" to be merge candidates, without a number. This is the
+    # fraction of the SHORTER cluster's frame span that must be covered by
+    # the overlap for it to count as "substantial."
+    temporal_overlap_min_fraction: float = 0.3
+    # A cluster spanning more than this fraction of the whole video's frames
+    # is a split candidate -- the roadmap's own number ("roughly 60 percent
+    # of the total video"), not a guess.
+    cluster_split_frame_span_fraction: float = 0.6
+    # ASSUMPTION: "poor tightness" for the split rule isn't numerically
+    # defined in the roadmap -- a cluster whose intra-cluster mean cosine
+    # similarity is below this is considered a split candidate (jointly with
+    # the frame-span rule above; both must fire).
+    cluster_split_tightness_max: float = 0.5
+    # ASSUMPTION: how much tighter the second, split-attempt DBSCAN pass's
+    # eps is vs. the main pass's cluster_eps -- multiplicative factor, not a
+    # roadmap-specified number.
+    cluster_split_eps_factor: float = 0.7
 
     # --- matching (Phase 6) ---
     match_threshold: float = 0.38  # cosine similarity, ArcFace r100

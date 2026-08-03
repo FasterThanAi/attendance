@@ -74,8 +74,13 @@ def build_contact_sheet(
 ) -> np.ndarray | None:
     frame_paths = sorted(frame_dir.glob("frame_*.jpg"))
 
-    accepted_rows = quality_df[quality_df["accepted"]]
-    rejected_rows = quality_df[~quality_df["accepted"]]
+    # .astype(bool): on a genuinely empty quality.parquet (0 detections),
+    # "accepted" round-trips as object-dtype, and boolean-masking a
+    # DataFrame with an object-dtype column -- even an empty one -- silently
+    # drops every column in pandas, not just every row.
+    accepted_mask = quality_df["accepted"].astype(bool)
+    accepted_rows = quality_df[accepted_mask]
+    rejected_rows = quality_df[~accepted_mask]
 
     sampled_accepted = (
         accepted_rows.sample(n=min(n_accepted, len(accepted_rows)), random_state=seed) if len(accepted_rows) else accepted_rows

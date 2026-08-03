@@ -16,9 +16,16 @@ this is a one-line fix if I guessed wrong.
 
 from __future__ import annotations
 
+import logging
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+
+from pipeline.params import PipelineParams
+
+logger = logging.getLogger("attend.worker.embed")
 
 RECOGNITION_MODEL_FILENAME = "w600k_r50.onnx"
 EMBEDDING_DIM = 512
@@ -91,3 +98,93 @@ def embed_batch(model: EmbedModel, aligned: np.ndarray) -> np.ndarray:
         raise ValueError(f"expected {EMBEDDING_DIM}-dim embeddings, model returned shape {embeddings.shape}")
 
     return l2_normalize(embeddings)
+
+
+# --------------------------------------------------------------------------
+# Phase 5: batch embedding for classroom video (embeds every crop
+# align_crops wrote in Phase 4)
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class EmbeddingSet:
+    embeddings_npy_path: Path
+    count: int
+    dim: int
+
+
+def embed_aligned(
+    aligned_memmap: np.ndarray, out_dir: Path, params: PipelineParams, model_dir: Path
+) -> EmbeddingSet:
+    """Phase 5 deliverable 1: embeds every crop in `aligned_memmap` (the
+    (N, 112, 112, 3) uint8 BGR array align_crops wrote in Phase 4),
+    `params.embed_batch_size` crops at a time through the singleton ArcFace
+    model, and writes the result to `out_dir/embeddings.npy` as a single
+    (N, 512) float32 L2-normalised memmap -- same self-describing
+    np.lib.format.open_memmap convention align_crops used for aligned.npy,
+    so later phases can `np.load(path, mmap_mode="r")` without needing
+    N/dtype passed out of band.
+
+    `model_dir` is not in the roadmap's literal `embed_aligned(aligned_memmap,
+    out_dir, params)` signature -- added for the same reason detect.py's
+    `detect_all_frames` needed an explicit model_dir: load_model() has to be
+    told where the ONNX weights live, and there's no other way to plumb that
+    through without a global.
+
+    ASSERTS BGR uint8 (112, 112, 3): insightface's ArcFace expects BGR, not
+    RGB -- getting this backwards is the single most common silent bug here
+    (the model still runs, it just embeds a colour-channel-swapped face, and
+    every similarity score becomes quietly wrong instead of erroring). Since
+    `aligned_memmap` is exactly what align_crops (Phase 4) wrote, and
+    align_face/cv2 never swap channels, this should always hold -- the check
+    below is a cheap, fail-loud tripwire in case anything upstream ever hands
+    this the wrong array.
+    """
+    n = aligned_memmap.shape[0]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    embeddings_npy_path = out_dir / "embeddings.npy"
+
+    if n == 0:
+        # An all-rejected video (Phase 4 can produce a 0-row aligned.npy) --
+        # write a valid, empty, still-self-describing embeddings.npy rather
+        # than crashing or skipping the file entirely.
+        np.save(embeddings_npy_path, np.zeros((0, EMBEDDING_DIM), dtype=np.float32))
+        logger.warning("embed stage: 0 aligned crops -- nothing to embed")
+        return EmbeddingSet(embeddings_npy_path=embeddings_npy_path, count=0, dim=EMBEDDING_DIM)
+
+    if aligned_memmap.ndim != 4 or tuple(aligned_memmap.shape[1:]) != (112, 112, 3) or aligned_memmap.dtype != np.uint8:
+        raise ValueError(
+            f"embed_aligned expects (N, 112, 112, 3) uint8 BGR, got shape="
+            f"{aligned_memmap.shape} dtype={aligned_memmap.dtype}"
+        )
+
+    model = load_model(model_dir)
+    batch_size = params.embed_batch_size
+
+    out_memmap = np.lib.format.open_memmap(
+        embeddings_npy_path, mode="w+", dtype=np.float32, shape=(n, EMBEDDING_DIM)
+    )
+
+    start_time = time.monotonic()
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        batch = np.ascontiguousarray(aligned_memmap[start:end])  # copy out of the memmap slice
+        out_memmap[start:end] = embed_batch(model, batch)
+    elapsed = time.monotonic() - start_time
+
+    out_memmap.flush()
+    del out_memmap  # release the file handle before returning
+
+    throughput = n / elapsed if elapsed > 0 else float("inf")
+    logger.info("embed stage: %d crops in %.2fs (%.1f crops/sec)", n, elapsed, throughput)
+
+    return EmbeddingSet(embeddings_npy_path=embeddings_npy_path, count=n, dim=EMBEDDING_DIM)
+
+
+def run_embed_stage(aligned_npy_path: Path, out_dir: Path, params: PipelineParams, model_dir: Path) -> EmbeddingSet:
+    """The I/O wrapper run.py's orchestrator calls: loads aligned.npy as a
+    memmap (never the whole array copied into RAM at once -- embed_aligned
+    only pulls out one batch at a time) and hands it to embed_aligned.
+    """
+    aligned_memmap = np.load(aligned_npy_path, mmap_mode="r")
+    return embed_aligned(aligned_memmap, out_dir, params, model_dir)

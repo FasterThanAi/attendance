@@ -1,5 +1,6 @@
 """Job orchestration (Phase 2 deliverable 3-4; Phase 3 wired in real
-extract/detect; Phase 4 wires in real quality/align).
+extract/detect; Phase 4 wired in real quality/align; Phase 5 wires in real
+embed/cluster).
 
 `process_session` is the single RQ entrypoint for the classroom-video
 pipeline. It runs each stage in order, skipping any stage whose on-disk
@@ -10,11 +11,10 @@ on any exception (rule: "a job that fails visibly is far better than a job
 that quietly marks students absent").
 
 Per the Phase 2 prompt, ALL stages started as stubs (log + write an empty
-manifest). Phase 3 replaced extract/detect; Phase 4 replaces quality/align
-with real implementations (pipeline.quality.run_quality_stage and
-pipeline.align.run_align_stage); embed/cluster/match stay stubs until
-Phases 5-6, one at a time, so it's always clear from this file which phase
-delivered which stage.
+manifest). Phase 3 replaced extract/detect, Phase 4 replaced quality/align,
+and Phase 5 replaces embed/cluster with real implementations
+(pipeline.embed.run_embed_stage and pipeline.cluster.run_cluster_stage);
+only `match` stays a stub until Phase 6.
 """
 
 from __future__ import annotations
@@ -33,7 +33,9 @@ from sqlalchemy import select, update
 from config import settings
 from db import get_engine, table
 from pipeline.align import run_align_stage
+from pipeline.cluster import run_cluster_stage
 from pipeline.detect import detect_all_frames
+from pipeline.embed import run_embed_stage
 from pipeline.extract import extract_frames
 from pipeline.params import PipelineParams
 from pipeline.quality import run_quality_stage
@@ -60,7 +62,11 @@ STAGE_PARAM_FIELDS: dict[str, list[str]] = {
     ],
     "align": ["embed_input_size"],
     "embed": ["embed_batch_size"],
-    "cluster": ["cluster_eps", "cluster_min_samples", "cluster_merge_distance_factor", "temporal_coherence_enabled"],
+    "cluster": [
+        "cluster_eps", "cluster_min_samples", "cluster_merge_distance_factor", "temporal_coherence_enabled",
+        "temporal_overlap_min_fraction", "cluster_split_frame_span_fraction",
+        "cluster_split_tightness_max", "cluster_split_eps_factor",
+    ],
     "match": ["match_threshold", "match_margin_min", "uncertain_band"],
 }
 
@@ -163,6 +169,26 @@ def _run_align_stage(stage_dir: Path, quality_parquet: Path, frame_dir: Path, pa
     return result.count
 
 
+def _run_embed_stage(stage_dir: Path, aligned_npy: Path, params: PipelineParams, model_dir: Path, job_id: int) -> int:
+    logger.info("job %s: stage 'embed' running (aligned=%s)", job_id, aligned_npy)
+    result = run_embed_stage(aligned_npy, stage_dir, params, model_dir)
+    logger.info("job %s: stage 'embed' done -- %s crop(s) embedded", job_id, result.count)
+    return result.count
+
+
+def _run_cluster_stage(
+    stage_dir: Path, embeddings_npy: Path, aligned_npy: Path, aligned_index_parquet: Path,
+    quality_parquet: Path, params: PipelineParams, job_id: int,
+) -> int:
+    logger.info("job %s: stage 'cluster' running (embeddings=%s)", job_id, embeddings_npy)
+    summary = run_cluster_stage(embeddings_npy, aligned_npy, aligned_index_parquet, quality_parquet, stage_dir, params)
+    logger.info(
+        "job %s: stage 'cluster' done -- %s clusters, %s noise, %s merges, %s split decisions",
+        job_id, summary.cluster_count, summary.noise_count, summary.merge_count, len(summary.split_log),
+    )
+    return summary.cluster_count
+
+
 def run_all_stages(
     job_dir: Path,
     params: PipelineParams,
@@ -172,20 +198,23 @@ def run_all_stages(
     model_dir: Path | None = None,
 ) -> None:
     """The actual stage loop: no database, no RQ, no network -- just the
-    filesystem under `job_dir`, `params`, and (for extract/detect only)
+    filesystem under `job_dir`, `params`, and (for extract/detect/embed)
     `video_path`/`model_dir`. Independently testable per non-negotiable
     rule #1; `process_session` below is a thin DB-aware wrapper around this.
 
-    quality/align (Phase 4) need no extra arguments beyond `job_dir` --
-    they read detect's/quality's own output straight from the filesystem
-    (`job_dir/detect/detections.parquet`, `job_dir/quality/quality.parquet`),
-    the same convention every stage here follows: read the previous stage's
-    directory, write your own.
+    quality/align/cluster need no extra arguments beyond `job_dir` -- they
+    read the previous stage's own output straight from the filesystem
+    (`job_dir/detect/detections.parquet`, `job_dir/quality/quality.parquet`,
+    `job_dir/align/aligned.npy`, `job_dir/embed/embeddings.npy`), the same
+    convention every stage here follows: read the previous stage's
+    directory, write your own. `embed` is the exception among the "no extra
+    args" group because, like detect, it needs to load an ONNX model.
 
-    `video_path`/`model_dir` are only required if the 'extract'/'detect'
-    stages actually need to run (i.e. aren't already cached) -- tests that
-    only exercise the stub stages, or that pre-seed extract/detect's
-    manifests, can omit them, same as before Phase 3 added real stages here.
+    `video_path`/`model_dir` are only required if the 'extract'/'detect'/
+    'embed' stages actually need to run (i.e. aren't already cached) --
+    tests that only exercise the stub stages, or that pre-seed those
+    stages' manifests, can omit them, same as before Phase 3 added real
+    stages here.
 
     `on_stage_start`, if given, is called with the stage name before each
     stage runs (process_session uses it to update processing_job.stage in
@@ -217,6 +246,19 @@ def run_all_stages(
         elif stage == "align":
             item_count = _run_align_stage(
                 stage_dir, job_dir / "quality" / "quality.parquet", job_dir / "extract", params, job_id
+            )
+        elif stage == "embed":
+            if model_dir is None:
+                raise ValueError("run_all_stages: 'embed' stage needs model_dir, none given")
+            item_count = _run_embed_stage(stage_dir, job_dir / "align" / "aligned.npy", params, model_dir, job_id)
+        elif stage == "cluster":
+            item_count = _run_cluster_stage(
+                stage_dir,
+                job_dir / "embed" / "embeddings.npy",
+                job_dir / "align" / "aligned.npy",
+                job_dir / "align" / "aligned_index.parquet",
+                job_dir / "quality" / "quality.parquet",
+                params, job_id,
             )
         else:
             item_count = _run_stub_stage(stage, stage_dir, job_id)

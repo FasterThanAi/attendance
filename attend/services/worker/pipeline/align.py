@@ -186,7 +186,14 @@ def run_align_stage(quality_parquet_path: Path, frame_dir: Path, out_dir: Path, 
     quality.parquet file on disk.
     """
     quality_df = pd.read_parquet(quality_parquet_path)
-    accepted_df = quality_df[quality_df["accepted"]].reset_index(drop=True)
+    # .astype(bool) matters more than it looks: on a genuinely empty (0-row)
+    # quality_df, "accepted" round-trips as an object-dtype column, and
+    # boolean-masking a DataFrame with an object-dtype (not bool-dtype)
+    # column -- even one with zero rows -- silently returns a DataFrame with
+    # NO COLUMNS AT ALL in pandas, not just zero rows. Without this cast, a
+    # video with zero detections would crash align_crops with a confusing
+    # KeyError on "det_id" instead of correctly producing zero aligned crops.
+    accepted_df = quality_df[quality_df["accepted"].astype(bool)].reset_index(drop=True)
 
     result = align_crops(accepted_df, frame_dir, out_dir, params)
     logger.info("align stage: %d accepted crop(s) aligned to %sx%s", result.count, params.embed_input_size, params.embed_input_size)

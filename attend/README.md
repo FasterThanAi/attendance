@@ -9,8 +9,9 @@ the parent folder) for the full 11-phase engineering plan this repo follows.
 This repo currently implements **Phase 0 (Foundations and consent)**,
 **Phase 1 (Enrollment and gallery construction)**,
 **Phase 2 (Upload and orchestration)**,
-**Phase 3 (Frames and detection)**, and
-**Phase 4 (Quality gate and alignment)**.
+**Phase 3 (Frames and detection)**,
+**Phase 4 (Quality gate and alignment)**, and
+**Phase 5 (Embedding and clustering)**.
 
 ## What's here
 
@@ -44,11 +45,20 @@ attend/
                             helpers, plus Phase 4's score_detections (the
                             full tunable-weight composite gate + accept/
                             reject rules over a whole detections.parquet)
-      embed.py              ArcFace r100 embedding via onnxruntime
-      run.py                orchestrator -- extract/detect (Phase 3) and
-                            quality/align (Phase 4) are now REAL;
-                            embed/cluster/match still stubs (Phases 5-6)
-      cluster.py, match.py  still stubs (Phases 5-6)
+      embed.py              ArcFace r100 embedding via onnxruntime: Phase 1's
+                            per-crop embed_batch, plus Phase 5's batch
+                            embed_aligned (embeddings.npy memmap, throughput
+                            logging)
+      cluster.py             Phase 5: DBSCAN over embeddings (cosine metric),
+                            quality-weighted cluster representatives,
+                            per-cluster diagnostics, best-crop selection,
+                            and a temporal-coherence merge/split post-pass
+                            exploiting the fact that the camera pans
+      run.py                orchestrator -- extract/detect (Phase 3),
+                            quality/align (Phase 4), and embed/cluster
+                            (Phase 5) are now REAL; only match is still a
+                            stub (Phase 6)
+      match.py               still a stub (Phase 6)
     db.py                  worker's own sync DB access (reflects tables live --
                           see its docstring for why this isn't shared with api)
     consent.py             sync consent gate (mirrors app/services/consent.py)
@@ -68,6 +78,15 @@ attend/
                           crops (labelled with quality score / reject_reason)
                           from a job's quality.parquet, to eyeball whether
                           the quality gate is calibrated sensibly
+    cluster_report.py       Phase 5: cluster count/noise, size + tightness
+                          distributions, and one contact-sheet-per-cluster
+                          image (up to 12 members) -- the main learning
+                          artifact of this phase
+    sweep_cluster.py         Phase 5: re-runs ONLY clustering across a
+                          cluster_eps x cluster_min_samples grid, reusing
+                          cached embeddings.npy (never re-running detect/
+                          embed); reports cluster count and purity if you
+                          supply a ground-truth CSV
 ```
 
 ## How to verify (Mac)
@@ -411,12 +430,121 @@ point it at. Also worth checking on your end: the roadmap's expectation that
 70-80% of detections get rejected and 3000-6000 crops survive from a
 90-student video -- I have no real footage to check those numbers against.
 
-## Next: Phase 5
+## Phase 5: what's new
 
-Embedding and clustering -- the intellectual core of the project. Each
-aligned crop becomes a 512-dim ArcFace vector (embed.py already exists from
-Phase 1); DBSCAN groups them into identities without knowing the headcount
-in advance, then a temporal-coherence pass (already documented in
-`cluster_merge_distance_factor`) merges clusters that are close in vector
-space AND overlap in time. Say "start phase 5" when Phase 4 is verified on
-your machine.
+- `pipeline/params.py` -- 4 new temporal-coherence tuning fields, all
+  flagged as ASSUMPTIONS since the roadmap gives numbers for some of these
+  and not others: `temporal_overlap_min_fraction` (0.3 -- roadmap says
+  "overlap substantially" with no number), `cluster_split_frame_span_fraction`
+  (0.6 -- this one IS the roadmap's own number, "roughly 60 percent of the
+  total video"), `cluster_split_tightness_max` (0.5 -- "poor tightness" has
+  no number given), `cluster_split_eps_factor` (0.7 -- how much tighter the
+  split-attempt DBSCAN pass's eps is). Synced into `run.py`'s
+  `STAGE_PARAM_FIELDS["cluster"]` and api's `DEFAULT_PIPELINE_PARAMS`.
+- `pipeline/embed.py` -- `embed_aligned(aligned_memmap, out_dir, params,
+  model_dir)`: batches through the singleton ArcFace model
+  `embed_batch_size` crops at a time, asserts BGR uint8 (112,112,3) input
+  (the single most common silent bug per the prompt), writes
+  `embeddings.npy` as a self-describing `(N,512)` float32 memmap, logs
+  crops/sec throughput. `run_embed_stage(...)` is the I/O wrapper.
+- `pipeline/cluster.py` -- new file, the intellectual core of the project:
+  - `cluster_embeddings(embeddings, quality_df, params) -> ClusterResult`:
+    DBSCAN with `metric="cosine"`; noise (`-1`) kept, never discarded; for
+    each cluster, a QUALITY-WEIGHTED mean representative (documented
+    rationale: a plain mean lets however many bad crops exist pull the
+    representative away from the good evidence in proportion to their
+    count, not their reliability -- weighting by Phase 4's own quality score
+    is the noise-averaging payoff Section 2.2 describes); per-cluster
+    diagnostics (member count, mean quality, intra-cluster mean cosine
+    similarity as "tightness," frame range); best_crop = highest-quality
+    member.
+  - The temporal-coherence post-pass (toggleable via
+    `temporal_coherence_enabled`, already existed as a placeholder field):
+    a merge step (union-find over cluster pairs whose representatives are
+    close AND whose frame ranges overlap substantially) and a split step
+    (a cluster spanning too much of the video with poor tightness gets a
+    second, tighter-eps DBSCAN pass restricted to its own members; logged
+    either way, including "flagged but couldn't actually split it").
+  - `run_cluster_stage(...)`: the I/O wrapper. Cross-checks that
+    `quality.parquet`'s accepted-row `det_id` order matches
+    `aligned_index.parquet`'s before trusting embeddings' row order to line
+    up with quality scores/frame indices -- fails loudly instead of silently
+    misattributing a quality score to the wrong crop if the two stages are
+    ever out of sync. Writes `clusters.parquet`, `cluster_summary.parquet`,
+    and one best-crop JPEG per cluster.
+- `pipeline/run.py` -- `embed` and `cluster` are now real stages. Only
+  `match` (Phase 6) remains a stub.
+- `eval/scripts/cluster_report.py` -- cluster/noise counts, size and
+  tightness distributions, and a contact-sheet image per cluster (up to 12
+  members) -- the roadmap's own framing: "the main learning artifact of
+  this phase... Looking at them is how you will understand what your
+  system is actually doing."
+- `eval/scripts/sweep_cluster.py` -- sweeps `cluster_eps` (0.30-0.55, step
+  0.02) x `cluster_min_samples` ({2,3,4,5}), reusing the SAME
+  `embeddings.npy` for all 20 grid points (never re-running detect/embed --
+  that's the entire point of Phase 2's stage caching). Reports cluster
+  count/noise, and purity if you supply a `det_id,true_label` ground-truth
+  CSV.
+- **A real bug found and fixed while testing this phase, not sandbox-specific**:
+  `quality_df[quality_df["accepted"]]` (used in `align.py`, `cluster.py`,
+  `contact_sheet.py`, and `sweep_cluster.py`) silently returns a
+  **columnless** DataFrame -- not just zero rows -- whenever `quality_df` is
+  genuinely empty (0 detections), because an empty `"accepted"` column
+  round-trips as `object` dtype rather than `bool`, and pandas boolean-masks
+  an object-dtype column differently. This would have crashed the `cluster`
+  stage with a confusing `KeyError: 'det_id'` on any real video that
+  produces zero detections. Fixed everywhere by casting
+  `.astype(bool)` before the mask. This is a genuine pandas edge case, not a
+  sandbox/pyarrow artifact -- I found it because my own `test_run.py`
+  verification exercises exactly this all-empty path.
+
+## Phase 5: how to verify
+
+```bash
+docker-compose up --build
+
+docker-compose exec worker pytest -v tests/test_cluster.py tests/test_embed_aligned.py tests/test_run.py
+```
+
+Expected: `test_cluster.py` (three well-separated Gaussian blobs -> exactly
+3 clusters; noise kept not discarded; quality weighting measurably shifts
+the representative toward high-quality members, both via the pure
+`_weighted_mean_vector` function and end-to-end through
+`cluster_embeddings`; the merge rule fires on constructed overlapping
+clusters and does NOT fire when frame ranges don't overlap), `test_embed_
+aligned.py` (correct memmap shape/dtype/normalisation, batching actually
+splits into `embed_batch_size`-sized chunks, empty input, BGR/shape
+assertion), and `test_run.py` (hash-invalidation cascade still correct with
+embed/cluster now real) all pass.
+
+I ran the equivalent logic directly in my sandbox: 61 tests total across
+every worker test file pass, including all of Phase 5's new ones. Since
+neither `scikit-learn` nor `pyarrow` are installed here (no PyPI access,
+same constraint every phase), I verified `cluster.py`'s actual logic against
+a from-scratch DBSCAN implementation (matching sklearn's documented
+semantics: cosine distance, core points via neighbor count including self,
+density-reachable expansion, border-point reassignment) written only for
+this verification, never shipped -- and against the same pickle-based
+parquet stand-in used in Phase 4's verification. This is exactly how I found
+the `accepted` boolean-mask bug described above: my hand-rolled DBSCAN
+correctly returned all-noise on the empty embeddings `test_run.py` feeds it,
+which then hit the real (unmocked) `cluster.py` code path and surfaced the
+bug immediately.
+
+What I could NOT verify: real `scikit-learn` DBSCAN's actual clustering
+behavior (my stand-in matches its documented semantics but is not the same
+code), real ArcFace embedding throughput/quality, and -- the thing that
+actually matters here -- whether clustering a real classroom video lands
+within the roadmap's "within roughly 20 percent of the true headcount"
+target. `cluster_report.py`'s per-cluster contact sheets are the tool for
+judging that once you have a real job to point it at; `sweep_cluster.py`
+is the tool for retuning `cluster_eps`/`cluster_min_samples` if the first
+attempt is off.
+
+## Next: Phase 6
+
+Matching and decisions -- assigns names to clusters using the gallery mean
+vectors Phase 1's enrollment already computed, via the Hungarian algorithm,
+and decides when NOT to assign a name (the three-band decision: confident
+match / uncertain -- flag for review / no match). Say "start phase 6" when
+Phase 5 is verified on your machine.
