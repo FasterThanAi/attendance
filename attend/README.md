@@ -669,12 +669,155 @@ stubbed out, not against a real `cluster_match` table). All of these are
 exactly the kind of thing your real Docker/Postgres run is positioned to
 confirm that I'm not.
 
-## Next: Phase 7
+## Phase 7: what's new
 
-Threshold calibration and end-to-end tuning against real recorded
-classroom sessions -- using `cluster_report.py`, `sweep_cluster.py`, and
-`match_report.py` together to retune `cluster_eps`/`match_threshold`/
-`match_margin_min`/`uncertain_band` against ground truth, and replacing this
-phase's `session_health`/temporal-coherence ASSUMPTION constants with
-numbers backed by real data. Say "start phase 7" when Phase 6 is verified
-on your machine.
+This phase is different in kind from Phases 1-6: it's an evaluation harness,
+not more pipeline code, and its central deliverable (a real accuracy number
+with failure modes characterised) depends entirely on real recorded video
+and real hand-labelled ground truth that only exists once you run this on
+your machine. What follows is the tooling; the report itself
+(`docs/EVALUATION.md`) is a filled-in-by-you template, not a result.
+
+- `eval/scripts/eval_lib.py` -- new shared module every other Phase 7 script
+  builds on, same pure/impure split as `pipeline/match.py`:
+  - Pure: `load_truth_csv`/`load_all_truth` (with a `_coerce_bool_column`
+    guard against a real pandas trap -- a hand-edited truth.csv with
+    `"TRUE"`/`"1"`/`"yes"` instead of clean `"True"`/`"False"` would
+    otherwise silently read as all-present, since a non-empty STRING
+    `"False"` is truthy in Python; `.astype(bool)` alone doesn't catch
+    this), `compute_confusion`/`precision_recall_f1`/`accuracy`,
+    `stratified_breakdown` (one row per group column x value, not a full
+    cross-product -- an 8-session dataset fragments into meaningless cells
+    otherwise), `predicted_present_from_matches` (CONFIDENT-only counts as
+    "system says present" -- documented once, here, since every script
+    depends on this scoring rule), `sweep_match_threshold` (re-runs
+    `match_clusters` at many thresholds against the SAME cached cluster
+    representatives), `pipeline_yield_for_session`, `clustering_quality`
+    (purity/over-split/merge rate from an optional, this-project's-own
+    `cluster_labels.csv` spot-labelling format -- the roadmap asks for this
+    metric but doesn't specify a label file format beyond "support partial
+    labelling"), and two ablation-only helpers: `plain_mean_representative`
+    (quality-weighting-off) and `majority_vote_predicted_present`
+    (clustering-off -- an ASSUMPTION vote-count threshold reusing
+    `cluster_min_samples`, documented in its own docstring).
+  - Impure: `fetch_session_context` (a plain-psycopg2 lookup, same
+    standalone style as `gallery_sanity.py`/`match_report.py`, turning a
+    `class_session_id` into enrolled students/gallery vectors/job_dir) and
+    `fetch_gallery_photo_uris`. Both defer their `psycopg2` import to
+    function-local, mirroring `pipeline/match.py`'s `run_match_stage` --
+    keeps every pure function above importable/testable without a DB
+    driver installed at all.
+  - CONVENTION this phase introduces: `eval/datasets/{session_id}/` -- the
+    directory name IS the `class_session_id`, as a string.
+- `eval/scripts/label_session.py` -- Phase 7 deliverable 1's tool.
+  Keyboard-only (space to play/pause, y/n to mark present/absent and
+  auto-advance, `[`/`]`/`1`-`3`/`g`/`e` for row/seat/glasses/notes,
+  `b`/`p` to go back or jump to a roll number), writes
+  `eval/datasets/{class_session_id}/truth.csv` after every single
+  keystroke that records a decision -- an interrupted 90-student labelling
+  session never loses progress. Resumes correctly if re-opened (loads
+  already-labelled rows back in) and never writes a false default for a
+  student you haven't gotten to yet.
+- `eval/scripts/evaluate.py` -- Phase 7 deliverable 2's core harness:
+  student-level precision/recall/F1/accuracy (FP and FN always reported
+  separately, never folded together), pipeline yield (mean detections per
+  present student, zero-accepted-crop fraction -- "the most important
+  single diagnostic," per the roadmap), clustering quality, and the
+  mandatory stratified breakdown by row_number/seat_position/wears_glasses.
+  Also runs the ablation study (`--ablation
+  {none,temporal-coherence-off,quality-weighting-off,clustering-off}`),
+  entirely from cached embeddings, no re-detection needed. The other two
+  ablations the roadmap asks for (tiled detection off, quality gating off)
+  change what gets DETECTED/ACCEPTED in the first place, not just how
+  accepted crops get clustered/matched -- those need a real pipeline
+  re-run at modified `PipelineParams` first; `evaluate.py`'s docstring
+  says so plainly rather than faking a shortcut.
+- `eval/scripts/sweep_threshold.py` -- Phase 7 deliverable 3. Re-runs ONLY
+  `match_clusters` across `match_threshold` 0.25-0.60 step 0.01 per
+  session, aggregates confusion counts (summed, not averaged, across
+  sessions of different sizes), writes a precision-recall curve and an
+  FP/FN-vs-threshold plot (`matplotlib`, added to
+  `services/worker/requirements.txt`), and a printed table. Deliberately
+  does NOT recommend the F1-maximising threshold as the answer -- F1
+  treats a false positive and a false negative as equally costly, and the
+  roadmap is explicit that they aren't ("false positives break the
+  anti-proxy claim, false negatives break teacher trust"). That choice,
+  and the written paragraph justifying it, is a human judgment call this
+  script hands back to you, not something it can make up.
+- `eval/scripts/failure_gallery.py` -- Phase 7 deliverable 4. One JPEG page
+  per false negative/false positive: up to 4 enrollment photos, up to 8
+  crops from whichever cluster the Hungarian algorithm actually linked
+  that student to (even an UNCERTAIN or UNMATCHED linkage still carries a
+  `student_id` in `pipeline.match`'s output -- only a truly unassigned
+  student's page says so explicitly, "zero linkable evidence"), and the
+  decision/similarity/runner-up numbers.
+- `docs/EVALUATION.md` -- the written-report skeleton (dataset description,
+  method, metrics table, stratified breakdown, threshold-selection
+  reasoning, three largest failure modes, limitations, ablation table),
+  structured exactly per the roadmap's required sections, with every
+  numeric section explicitly marked `PENDING` and the exact command to run
+  to fill it in -- not fabricated placeholder numbers.
+- `pipeline/params.py` -- `match_threshold`'s comment now explicitly flags
+  it as an uncalibrated first-pass guess and points at
+  `sweep_threshold.py`/`docs/EVALUATION.md` section 5 as where the real
+  value comes from.
+
+## Phase 7: how to verify
+
+Unlike every prior phase, there is no "run these against real footage and
+confirm N/N pass" step here, because this phase's whole point is that N/N
+doesn't exist until you provide 8+ real labelled sessions. What IS
+verifiable without that:
+
+```bash
+docker-compose exec worker pytest -v eval/scripts/tests/test_eval_lib.py
+```
+
+Expected: all of `eval_lib.py`'s pure functions pass -- confusion-matrix
+counting, precision/recall/F1 (including the zero-positives edge case),
+the stratified breakdown genuinely surfacing a row-1-vs-row-6 gap an
+aggregate would hide, the CONFIDENT-only scoring rule, the threshold
+sweep's recall dropping as the threshold rises on a constructed example,
+`rows_for_session` correctly leaving an unmapped roll_number as NaN rather
+than guessing, the zero-accepted-crop "unrecoverable failure" flag, and the
+majority-vote ablation's vote-counting.
+
+I ran the equivalent logic directly in my sandbox: all 16 tests pass.
+Beyond the unit tests, I built synthetic job_dir fixtures (a fake
+`cluster_summary.parquet`/`embeddings.npy`/`quality.parquet`/
+`aligned_index.parquet`, using the same pickle-based parquet stand-in as
+every prior phase's sandbox verification, since `pyarrow` isn't installed
+here) and a synthetic 4-student `truth.csv`, then ran `evaluate.py`'s full
+`run()` end-to-end against them (with `fetch_session_context`
+monkeypatched to skip the real DB call) across all four ablation modes,
+`sweep_threshold.py`'s full sweep (confirmed it writes two valid, non-empty
+PNGs and a table whose numbers exactly match `evaluate.py`'s baseline
+figures for the same fixture), and `failure_gallery.py` (confirmed it
+correctly identified the one constructed false-negative student and wrote
+a valid, readable JPEG page for them). All of this exercised real,
+un-mocked scoring/aggregation/plotting logic -- only the DB queries
+themselves were stubbed out, exactly the same boundary every prior phase's
+sandbox verification has had (no Postgres/real video available here).
+`sklearn.cluster.DBSCAN` and `scipy.optimize.linear_sum_assignment` were
+exercised via the same from-scratch stand-ins built for Phase 5/6's
+verification (not shipped -- the real code imports the genuine libraries,
+pinned in `requirements.txt`).
+
+What I could NOT verify, and what only your machine can: `label_session.py`
+against a real video file and a real Postgres roster (needs `cv2.VideoCapture`
+on a real file and a real DB connection -- I exercised its save/load
+round-trip logic directly instead, including the same bool-coercion trap
+`eval_lib.py` guards against); anything about real accuracy numbers,
+real failure modes, or a real threshold choice, since those don't exist
+without real recorded, labelled classroom sessions. `docs/EVALUATION.md`
+is scaffolding, not a result, until you've run the tools above against your
+own 8+ sessions.
+
+## Next: Phase 8
+
+Teacher review UI and the append-only attendance commit flow -- turning a
+session's draft roster (`GET /sessions/{id}/draft`, Phase 6) plus the
+`match_threshold` you just calibrated into `AttendanceRecord` rows a
+teacher can confirm or override, never mutating a past record (non-negotiable
+rule #4: corrections are new rows with `supersedes_id`, not updates). Say
+"start phase 8" when Phase 7 is verified on your machine.

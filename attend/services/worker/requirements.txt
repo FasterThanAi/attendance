@@ -36,3 +36,8 @@ pyarrow==17.0.0
 # Phase 6: scipy.optimize.linear_sum_assignment (Hungarian algorithm) for
 # one-to-one cluster-to-student assignment in pipeline/match.py.
 scipy==1.14.1
+
+# Phase 7: precision-recall curve and false-positive/false-negative-vs-
+# threshold plots in eval/scripts/sweep_threshold.py. Only eval/scripts
+# needs this -- not imported by anything under pipeline/ or services/.
+matplotlib==3.9.2

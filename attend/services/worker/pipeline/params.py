@@ -124,6 +124,15 @@ class PipelineParams:
     cluster_split_eps_factor: float = 0.7
 
     # --- matching (Phase 6) ---
+    # ASSUMPTION, not yet calibrated: 0.38 is a first-pass guess (a typical
+    # ArcFace r100 operating point for this kind of similarity), not a
+    # number derived from real labelled sessions. Phase 7's own explicit job
+    # is to replace this with a value chosen by running
+    # eval/scripts/sweep_threshold.py against >= 8 real labelled sessions
+    # and deliberately picking an operating point (see docs/EVALUATION.md
+    # section 5) -- once that's done, this comment should be replaced with
+    # the date, the dataset it was calibrated on, and the reasoning, per
+    # the roadmap's own instruction, not left as this placeholder.
     match_threshold: float = 0.38  # cosine similarity, ArcFace r100
     match_margin_min: float = 0.05  # top1 minus top2 (Hungarian assignment)
     uncertain_band: float = 0.08  # below threshold by this much -> review
