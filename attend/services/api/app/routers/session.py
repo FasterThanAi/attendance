@@ -32,6 +32,7 @@ from app.db.models import (
     Teacher,
 )
 from app.db.session import get_db
+from app.media import to_media_url
 from app.schemas.errors import ErrorResponse
 from app.schemas.session import ClassSessionCreate, ClassSessionResponse
 from app.schemas.session_draft import (
@@ -149,7 +150,7 @@ async def get_session_draft(session_id: int, db: AsyncSession = Depends(get_db))
                 .limit(1)
             )
         ).scalar_one_or_none()
-        return photo_row.storage_uri if photo_row else None
+        return to_media_url(photo_row.storage_uri) if photo_row else None
 
     confident: list[DraftClusterMatch] = []
     needs_review: list[DraftClusterMatch] = []
@@ -159,7 +160,7 @@ async def get_session_draft(session_id: int, db: AsyncSession = Depends(get_db))
     for cluster, match, student in rows:
         entry = DraftClusterMatch(
             cluster_id=cluster.id,
-            best_crop_uri=cluster.best_crop_uri,
+            best_crop_uri=to_media_url(cluster.best_crop_uri) or "",
             student_id=student.id if student else None,
             student_name=student.full_name if student else None,
             roll_number=student.roll_number if student else None,
@@ -190,7 +191,16 @@ async def get_session_draft(session_id: int, db: AsyncSession = Depends(get_db))
     ).scalars().all()
 
     proposed_absent = [
-        DraftAbsentStudent(student_id=s.id, student_name=s.full_name, roll_number=s.roll_number)
+        DraftAbsentStudent(
+            student_id=s.id,
+            student_name=s.full_name,
+            roll_number=s.roll_number,
+            # Phase 8 gap fix: the "Not Found" review grid needs each
+            # student's enrollment photo to render a tappable tile (same as
+            # confident/needs_review entries already do) -- reuses the same
+            # highest-quality_score lookup defined above.
+            enrollment_photo_uri=await _enrollment_photo_uri(s.id),
+        )
         for s in enrolled_rows
         if s.id not in matched_student_ids
     ]

@@ -40,6 +40,7 @@ class DraftAbsentStudent(BaseModel):
     student_id: int
     student_name: str
     roll_number: str
+    enrollment_photo_uri: str | None
 
 
 class SessionDraftResponse(BaseModel):

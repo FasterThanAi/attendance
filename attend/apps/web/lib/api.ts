@@ -1,6 +1,21 @@
 export const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
 
+/**
+ * Phase 8 gap fix: the api rewrites raw pipeline artifact paths into
+ * "/media/..." paths (see services/api/app/media.py), but a path like that
+ * is relative -- an <img src="/media/...">  resolves against whatever
+ * origin the browser is currently on, which is the Next.js app
+ * (localhost:3000), not the api (localhost:8000). This prefixes any
+ * relative media path with API_BASE_URL so images actually load. Already-
+ * absolute URLs (http/https, e.g. a future S3 uri) pass through unchanged.
+ */
+export function mediaUrl(uri: string | null): string | null {
+  if (!uri) return uri;
+  if (uri.startsWith("http://") || uri.startsWith("https://")) return uri;
+  return `${API_BASE_URL}${uri}`;
+}
+
 export class ApiError extends Error {
   code: string;
 

@@ -297,6 +297,18 @@ class ClassSession(Base):
     # invariant on) once, at job-completion time.
     draft_summary_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # --- Phase 8 addition: commit idempotency ---
+    # Phase 8 deliverable 3: "the commit endpoint must be idempotent on a
+    # client-supplied request id, so a double tap on a bad network cannot
+    # double-commit." Stored on class_session (not a separate generic
+    # idempotency-key table) because commit is a per-session, once-only
+    # transition (status -> committed) -- there is exactly one meaningful
+    # "the commit for this session" to be idempotent about, not a general
+    # need to dedupe arbitrary requests. UNIQUE (not just indexed) so two
+    # DIFFERENT sessions can never accidentally collide on the same
+    # client-generated id.
+    commit_request_id: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
+
 
 class VideoUpload(Base):
     __tablename__ = "video_upload"

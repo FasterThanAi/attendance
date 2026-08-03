@@ -12,10 +12,11 @@ import uuid
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.logging_config import configure_logging, request_id_ctx
-from app.routers import enrollment, health, job, session, upload
+from app.routers import attendance, enrollment, health, job, session, upload
 from app.schemas.errors import ErrorResponse
 from app.services.consent import ConsentError
 
@@ -64,3 +65,12 @@ app.include_router(enrollment.router)
 app.include_router(session.router)
 app.include_router(upload.router)
 app.include_router(job.router)
+app.include_router(attendance.router)
+
+# Phase 8 gap fix (see app/media.py's docstring): pipeline artifacts
+# (enrollment photos, best-crop images) live on the same shared volume the
+# worker writes to (settings.job_data_dir). Mounting it here is what makes
+# app/media.py's rewritten "/media/..." URLs actually resolvable. check_dir
+# is off so a fresh checkout with no jobs run yet (dir doesn't exist) still
+# boots the API instead of crashing on startup.
+app.mount("/media", StaticFiles(directory=settings.job_data_dir, check_dir=False), name="media")
