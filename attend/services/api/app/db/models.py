@@ -287,6 +287,16 @@ class ClassSession(Base):
     room: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[ClassSessionStatus] = _enum_column(ClassSessionStatus, "class_session_status")
 
+    # --- Phase 6 addition: the computed draft roster summary ---
+    # Phase 6's prompt (deliverable 4): "compute and store on the draft a
+    # summary object." Stored here as JSON (session_health, coverage_percent,
+    # etc. -- see pipeline.match.SessionSummary) rather than as individual
+    # columns, since GET /sessions/{id}/draft's own re-derivation of the same
+    # numbers from detected_cluster/cluster_match every request would be
+    # redundant with what the match stage already computed (and asserted the
+    # invariant on) once, at job-completion time.
+    draft_summary_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
 
 class VideoUpload(Base):
     __tablename__ = "video_upload"
@@ -302,6 +312,16 @@ class VideoUpload(Base):
     fps: Mapped[float] = mapped_column(Float, nullable=False)
     bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    # --- Phase 6 addition: persist the pre-flight result ---
+    # Phase 2 computed this (run_preflight_and_wait) but only ever returned it
+    # in the upload-complete HTTP response -- nothing stored it. Phase 6's
+    # session_health needs to know "did this session's pre-flight check have
+    # warnings" well after that response was sent, so it has to live
+    # somewhere durable. A JSON blob here (not a new table) because it's the
+    # exact same dict already being serialised for the API response, and
+    # nothing else needs to query into its structure relationally.
+    preflight_status_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class ProcessingJob(Base):

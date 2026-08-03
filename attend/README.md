@@ -541,10 +541,140 @@ judging that once you have a real job to point it at; `sweep_cluster.py`
 is the tool for retuning `cluster_eps`/`cluster_min_samples` if the first
 attempt is off.
 
-## Next: Phase 6
+## Phase 6: what's new
 
-Matching and decisions -- assigns names to clusters using the gallery mean
-vectors Phase 1's enrollment already computed, via the Hungarian algorithm,
-and decides when NOT to assign a name (the three-band decision: confident
-match / uncertain -- flag for review / no match). Say "start phase 6" when
-Phase 5 is verified on your machine.
+- `pipeline/match.py` -- new logic, split pure/DB exactly like
+  `enrollment.py`'s `process_enrollment_video`/`enroll_student`:
+  - `match_clusters(cluster_reps, gallery, params)`: cosine similarity matrix
+    (one matrix multiply, both sides already L2-normalised) then the
+    **Hungarian algorithm** (`scipy.optimize.linear_sum_assignment`) for a
+    globally-optimal one-to-one cluster-to-student assignment. NOT greedy
+    top-1: two clusters can each have their single highest similarity
+    pointed at the same gallery student (two people who look alike, or a
+    noisy crop embedding slightly toward a third identity) -- greedy would
+    double-book that student and stick the other cluster with whatever's
+    left, even when a better global arrangement exists. `runner_up_similarity`
+    is the best similarity to any OTHER gallery entry for that cluster, not
+    the second-best row in the overall solution.
+  - Three-band decision (`_decide_band`), verbatim from the roadmap:
+    `margin = similarity - runner_up_similarity`; CONFIDENT if
+    `similarity >= match_threshold AND margin >= match_margin_min`;
+    UNCERTAIN if `similarity >= match_threshold - uncertain_band`;
+    UNMATCHED otherwise.
+  - `build_session_summary(...)`: proposed_present / needs_review /
+    proposed_absent / unrecognised_clusters, `coverage_percent`,
+    `mean_confident_similarity`, and a `session_health` rating (good/fair/poor
+    -- ASSUMPTION thresholds, see `params.py`, since the roadmap names the
+    three poor-health conditions but not numeric cutoffs). Hard invariant,
+    enforced by raising (never silently routed around): `proposed_present +
+    needs_review + proposed_absent == total_enrolled`, exactly.
+  - `run_match_stage(...)`: the DB-aware orchestrator. Inserts one
+    `detected_cluster` row per cluster first (so its DB-generated id can be
+    used directly as `ClusterMatch.cluster_id` -- no separate id-mapping
+    step), queries ONLY this course's `enrollment` for the gallery (never
+    the whole institution), calls the pure functions above, inserts
+    `cluster_match` rows, reads `video_upload.preflight_status_json` for
+    `session_health`'s warnings input, and persists
+    `class_session.draft_summary_json` + flips status to
+    `awaiting_review`. Does **not** write `attendance_record` rows --
+    turning a draft into committed attendance is Phase 8's job.
+  - sqlalchemy/config/db imports are deferred (function-local, not
+    module-level) specifically so `match_clusters`/`build_session_summary`/
+    `build_gallery_matrix` stay importable and unit-testable without the
+    full worker DB stack installed -- see the module docstring.
+- Two gaps found while building this phase, both fixed:
+  - `cluster_summary.parquet` (Phase 5) never actually stored the cluster's
+    representative vector, even though Phase 6's own integration contract
+    says "Consumes: cluster_summary.parquet with representative vectors."
+    Added a `representative_vector` bytes column.
+  - Phase 2's pre-flight check result was only ever returned in the
+    upload-complete HTTP response, never stored -- but `session_health`
+    needs it long after that response was sent. Added
+    `video_upload.preflight_status_json`, persisted in
+    `routers/upload.py`'s `complete_upload`.
+- `services/api/app/db/models.py` -- `DetectedCluster`/`ClusterMatch`/the
+  three related enums were already fully specified back in Phase 0 (a
+  pleasant surprise); only 2 new nullable columns needed:
+  `video_upload.preflight_status_json`, `class_session.draft_summary_json`.
+  Migration `0003_phase6_additions.py`.
+- `services/worker/db.py` -- reflected-table list extended with
+  `enrollment`, `class_session`, `course`, `detected_cluster`,
+  `cluster_match`.
+- `pipeline/run.py` -- `match` is now a real stage, the last one in
+  `STAGE_ORDER`; every stage is now real, none are stubs. `match` needs
+  `class_session_id`/`processing_job_id` (new `run_all_stages` parameters,
+  same "raise loudly if the stage needs to run and the argument is missing"
+  pattern as `video_path`/`model_dir`).
+- `GET /sessions/{id}/draft` (`routers/session.py` +
+  `schemas/session_draft.py`) -- the session summary plus all three bands,
+  each entry carrying student name/roll number/similarity/cluster best-crop
+  URI/enrollment photo URI. Never a raw embedding vector anywhere in the
+  response, per the roadmap's rule for this endpoint. 409 if the match
+  stage hasn't run yet (`draft_summary_json IS NULL`).
+- `eval/scripts/match_report.py` -- counts per band, a similarity
+  distribution per band, and the ten lowest-margin CONFIDENT matches (the
+  ones closest to being reclassified as uncertain if the threshold moved).
+  Talks to Postgres directly (plain `psycopg2`, same pattern as
+  `gallery_sanity.py`) rather than reading a job_dir file, because match is
+  the one pipeline stage whose output lives in the DB, not the filesystem.
+
+## Phase 6: how to verify
+
+```bash
+docker-compose up --build
+
+docker-compose exec worker pytest -v tests/test_match.py tests/test_run.py
+```
+
+Expected: `test_match.py` -- Hungarian assignment beats greedy on a
+constructed matrix where a naive top-1 greedy would double-book a gallery
+student (both tests assert the OPPOSITE, better assignment plus a strictly
+higher total similarity); band boundaries exact at the threshold/margin/
+uncertain-band values; `match_clusters` never returns a student id outside
+the gallery dict it was given; the session-summary invariant holds on a
+realistic mixed-band scenario and raises `ValueError` on a deliberately
+corrupted `matches` list (same student both confident and uncertain --
+something real Hungarian output can never produce, but the function must
+still refuse it). `test_run.py` -- the `match` stage is now real in the
+orchestration/caching tests too (fully faked out via
+`monkeypatch.setattr("pipeline.run.run_match_stage", ...)`, same treatment
+as `extract_frames`/`detect_all_frames`, since unlike every other stage it
+needs a live DB this filesystem-only test file deliberately has none of);
+two new tests confirm it raises loudly if `class_session_id` or
+`processing_job_id` is missing when the stage actually needs to run.
+
+I ran the pure-function tests directly in my sandbox: all 15 pass. Neither
+`scipy` nor `sqlalchemy` are installed here (no PyPI access, same constraint
+every phase), so I wrote a small, genuinely-correct (brute-force, not
+approximate) `linear_sum_assignment` stand-in for verification only --
+never shipped, the real code imports actual `scipy.optimize`. To keep
+`match_clusters`/`build_session_summary` testable at all without
+`sqlalchemy` installed, I moved the DB-touching imports (`sqlalchemy`,
+`config`, `db`) to be function-local inside `run_match_stage` rather than
+module-level -- this is a real design improvement, not just a sandbox
+workaround: it means the pure decision logic can be imported and tested in
+any environment with numpy/scipy, without dragging in Postgres client
+libraries it never needs. I also re-ran every other sandbox-runnable test
+file (`test_align.py`, `test_detect_tiling.py`, `test_quality.py`,
+`test_placeholder.py`) to confirm the `db.py`/`run.py` edits didn't break
+anything import-level; all still pass.
+
+What I could NOT verify: `run_match_stage` itself (needs a real Postgres
+with the `enrollment`/`course`/`class_session` tables populated), the
+`GET /sessions/{id}/draft` endpoint (needs a real async DB session and
+FastAPI test client -- `fastapi`/`sqlalchemy`/`asyncpg` aren't installed
+here), and `match_report.py`'s DB query itself (verified its
+histogram/margin-sorting *logic* against synthetic rows with `psycopg2`
+stubbed out, not against a real `cluster_match` table). All of these are
+exactly the kind of thing your real Docker/Postgres run is positioned to
+confirm that I'm not.
+
+## Next: Phase 7
+
+Threshold calibration and end-to-end tuning against real recorded
+classroom sessions -- using `cluster_report.py`, `sweep_cluster.py`, and
+`match_report.py` together to retune `cluster_eps`/`match_threshold`/
+`match_margin_min`/`uncertain_band` against ground truth, and replacing this
+phase's `session_health`/temporal-coherence ASSUMPTION constants with
+numbers backed by real data. Say "start phase 7" when Phase 6 is verified
+on your machine.

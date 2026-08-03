@@ -1,6 +1,6 @@
 """Job orchestration (Phase 2 deliverable 3-4; Phase 3 wired in real
-extract/detect; Phase 4 wired in real quality/align; Phase 5 wires in real
-embed/cluster).
+extract/detect; Phase 4 wired in real quality/align; Phase 5 wired in real
+embed/cluster; Phase 6 wires in the real match stage).
 
 `process_session` is the single RQ entrypoint for the classroom-video
 pipeline. It runs each stage in order, skipping any stage whose on-disk
@@ -12,9 +12,15 @@ that quietly marks students absent").
 
 Per the Phase 2 prompt, ALL stages started as stubs (log + write an empty
 manifest). Phase 3 replaced extract/detect, Phase 4 replaced quality/align,
-and Phase 5 replaces embed/cluster with real implementations
-(pipeline.embed.run_embed_stage and pipeline.cluster.run_cluster_stage);
-only `match` stays a stub until Phase 6.
+Phase 5 replaced embed/cluster, and Phase 6 replaces `match`
+(pipeline.match.run_match_stage) -- every stage in STAGE_ORDER is now a real
+implementation.
+
+`match` is the one stage that is NOT purely file-based (job_dir in, job_dir
+out): it needs the session's class_session_id/course enrollment/gallery
+vectors from the live DB, and writes detected_cluster/cluster_match rows
+directly rather than a job_dir file -- see pipeline/match.py's module
+docstring for why its DB access is deferred-imported rather than module-level.
 """
 
 from __future__ import annotations
@@ -37,6 +43,7 @@ from pipeline.cluster import run_cluster_stage
 from pipeline.detect import detect_all_frames
 from pipeline.embed import run_embed_stage
 from pipeline.extract import extract_frames
+from pipeline.match import run_match_stage
 from pipeline.params import PipelineParams
 from pipeline.quality import run_quality_stage
 
@@ -67,7 +74,11 @@ STAGE_PARAM_FIELDS: dict[str, list[str]] = {
         "temporal_overlap_min_fraction", "cluster_split_frame_span_fraction",
         "cluster_split_tightness_max", "cluster_split_eps_factor",
     ],
-    "match": ["match_threshold", "match_margin_min", "uncertain_band"],
+    "match": [
+        "match_threshold", "match_margin_min", "uncertain_band",
+        "session_health_poor_coverage_percent", "session_health_fair_coverage_percent",
+        "session_health_poor_mean_similarity",
+    ],
 }
 
 
@@ -189,6 +200,23 @@ def _run_cluster_stage(
     return summary.cluster_count
 
 
+def _run_match_stage(
+    cluster_summary_parquet: Path, class_session_id: int, processing_job_id: int, params: PipelineParams, job_id: int,
+) -> int:
+    logger.info(
+        "job %s: stage 'match' running (class_session_id=%s, cluster_summary=%s)",
+        job_id, class_session_id, cluster_summary_parquet,
+    )
+    summary = run_match_stage(cluster_summary_parquet, class_session_id, params, processing_job_id)
+    logger.info(
+        "job %s: stage 'match' done -- %s clusters (%s confident, %s uncertain, %s unmatched), "
+        "session_health=%s, coverage=%.1f%%",
+        job_id, summary.cluster_count, summary.confident_count, summary.uncertain_count, summary.unmatched_count,
+        summary.session_summary.session_health, summary.session_summary.coverage_percent,
+    )
+    return summary.cluster_count
+
+
 def run_all_stages(
     job_dir: Path,
     params: PipelineParams,
@@ -196,6 +224,8 @@ def run_all_stages(
     on_stage_start: Callable[[str], None] | None = None,
     video_path: Path | None = None,
     model_dir: Path | None = None,
+    class_session_id: int | None = None,
+    processing_job_id: int | None = None,
 ) -> None:
     """The actual stage loop: no database, no RQ, no network -- just the
     filesystem under `job_dir`, `params`, and (for extract/detect/embed)
@@ -211,9 +241,10 @@ def run_all_stages(
     args" group because, like detect, it needs to load an ONNX model.
 
     `video_path`/`model_dir` are only required if the 'extract'/'detect'/
-    'embed' stages actually need to run (i.e. aren't already cached) --
-    tests that only exercise the stub stages, or that pre-seed those
-    stages' manifests, can omit them, same as before Phase 3 added real
+    'embed' stages actually need to run (i.e. aren't already cached);
+    `class_session_id`/`processing_job_id` are only required if 'match'
+    actually needs to run -- tests that pre-seed those stages' manifests
+    can omit the corresponding argument, same as before Phase 3 added real
     stages here.
 
     `on_stage_start`, if given, is called with the stage name before each
@@ -260,6 +291,14 @@ def run_all_stages(
                 job_dir / "quality" / "quality.parquet",
                 params, job_id,
             )
+        elif stage == "match":
+            if class_session_id is None or processing_job_id is None:
+                raise ValueError(
+                    "run_all_stages: 'match' stage needs class_session_id and processing_job_id, none given"
+                )
+            item_count = _run_match_stage(
+                job_dir / "cluster" / "cluster_summary.parquet", class_session_id, processing_job_id, params, job_id,
+            )
         else:
             item_count = _run_stub_stage(stage, stage_dir, job_id)
 
@@ -305,6 +344,8 @@ def process_session(job_id: int) -> None:
             on_stage_start=on_stage_start,
             video_path=video_path,
             model_dir=model_dir,
+            class_session_id=row["class_session_id"],
+            processing_job_id=job_id,
         )
 
     except Exception as exc:

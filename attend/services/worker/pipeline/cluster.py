@@ -428,10 +428,19 @@ def run_cluster_stage(
             "first_frame": diag.first_frame,
             "last_frame": diag.last_frame,
             "best_crop_uri": best_crop_uri,
+            # Phase 6's integration contract: "Consumes: cluster_summary.parquet
+            # WITH REPRESENTATIVE VECTORS." Stored as raw float32 bytes, same
+            # convention as gallery_embedding.vector in the DB -- matching's
+            # gallery-similarity computation needs this, not just the scalar
+            # diagnostics above.
+            "representative_vector": diag.representative.astype(np.float32).tobytes(),
         })
 
     cluster_summary_parquet_path = out_dir / "cluster_summary.parquet"
-    summary_columns = ["cluster_id", "member_count", "mean_quality", "tightness", "first_frame", "last_frame", "best_crop_uri"]
+    summary_columns = [
+        "cluster_id", "member_count", "mean_quality", "tightness", "first_frame", "last_frame",
+        "best_crop_uri", "representative_vector",
+    ]
     summary_df = pd.DataFrame(summary_rows) if summary_rows else pd.DataFrame(columns=summary_columns)
     summary_df.to_parquet(cluster_summary_parquet_path)
 

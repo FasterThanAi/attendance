@@ -32,3 +32,7 @@ scikit-learn==1.5.2
 # equivalent, and pandas/pyarrow are the standard combo for this.
 pandas==2.2.3
 pyarrow==17.0.0
+
+# Phase 6: scipy.optimize.linear_sum_assignment (Hungarian algorithm) for
+# one-to-one cluster-to-student assignment in pipeline/match.py.
+scipy==1.14.1

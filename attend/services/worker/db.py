@@ -8,14 +8,19 @@ image). Sharing one ORM module across a real package boundary would mean
 either publishing an internal pip package or symlinking source across build
 contexts -- both are more machinery than this project's size justifies.
 
-Instead, this module REFLECTS the four tables the worker actually touches
-(consent, student, gallery_photo, gallery_embedding) directly from the live
-database via SQLAlchemy's autoload_with. This means the worker can never
-have a stale, hand-copied version of a column definition -- if
-services/api/app/db/models.py adds a column via a migration, this file sees
-it automatically, at the cost of needing a real DB connection at import time
-(acceptable: this module is only imported inside the worker process, which
-always has one).
+Instead, this module REFLECTS the tables the worker actually touches
+directly from the live database via SQLAlchemy's autoload_with. This means
+the worker can never have a stale, hand-copied version of a column
+definition -- if services/api/app/db/models.py adds a column via a
+migration, this file sees it automatically, at the cost of needing a real
+DB connection at import time (acceptable: this module is only imported
+inside the worker process, which always has one).
+
+Phase 6 addition: `enrollment`, `class_session`, `course`, `detected_cluster`,
+`cluster_match` -- the match stage (pipeline/match.py's run_match_stage)
+needs to look up which students are enrolled in a session's course, read
+each one's cached gallery vector (already reflected via `student`), and
+write its own DetectedCluster/ClusterMatch rows.
 
 KNOWN TRADE-OFF, flagged rather than hidden: the *business rule* "a consent
 row exists and isn't revoked" is expressed twice -- once in
@@ -54,7 +59,10 @@ def _metadata() -> MetaData:
     metadata = MetaData()
     metadata.reflect(
         bind=get_engine(),
-        only=["consent", "student", "gallery_photo", "gallery_embedding", "processing_job", "video_upload"],
+        only=[
+            "consent", "student", "gallery_photo", "gallery_embedding", "processing_job", "video_upload",
+            "enrollment", "class_session", "course", "detected_cluster", "cluster_match",
+        ],
     )
     return metadata
 

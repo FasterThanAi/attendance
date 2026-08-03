@@ -128,6 +128,16 @@ class PipelineParams:
     match_margin_min: float = 0.05  # top1 minus top2 (Hungarian assignment)
     uncertain_band: float = 0.08  # below threshold by this much -> review
 
+    # --- session health (Phase 6) ---
+    # ASSUMPTIONS: the roadmap says session_health should be "poor" when
+    # coverage_percent is low, mean_confident_similarity is low, or the
+    # pre-flight check warned -- without giving numbers for the first two.
+    # These three are first-pass guesses, exactly like preflight.py's
+    # thresholds; Phase 7 is where you'd calibrate them against real sessions.
+    session_health_poor_coverage_percent: float = 60.0  # below this -> poor regardless of anything else
+    session_health_fair_coverage_percent: float = 85.0  # between poor and this -> fair; at/above -> good
+    session_health_poor_mean_similarity: float = 0.45  # confident matches averaging below this -> poor
+
     # --- pre-flight quality check (Phase 2) ---
     # ASSUMPTION: these thresholds are a first-pass guess, not calibrated
     # against real classroom footage -- I have no real 4K pan video to test

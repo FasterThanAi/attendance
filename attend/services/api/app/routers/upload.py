@@ -4,6 +4,8 @@ pre-flight check wired into /complete.
 
 from __future__ import annotations
 
+import json
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -116,6 +118,12 @@ async def complete_upload(upload_id: str, db: AsyncSession = Depends(get_db)) ->
                 "message": "Could not finish the quality check in time. Processing will continue anyway.",
             }],
         }
+
+    # Phase 6 addition: persist this result -- session_health (Phase 6) needs
+    # to know whether THIS session's pre-flight had warnings long after this
+    # response has been sent and forgotten. See VideoUpload.preflight_status_json.
+    video_upload.preflight_status_json = json.dumps(preflight_dict)
+    await db.commit()
 
     return UploadCompleteResponse(
         video_upload=VideoUploadResponse.model_validate(video_upload),
