@@ -1,0 +1,12 @@
+[tool.pytest.ini_options]
+# Explicit rather than relying on rootdir/package inference, because
+# services/worker/__init__.py exists (harmless leftover from the Phase 0
+# skeleton) and would otherwise make pytest treat top-level modules like
+# `pipeline`, `db`, `config`, `consent`, `enrollment` as needing a parent
+# package on sys.path instead of being directly importable.
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"

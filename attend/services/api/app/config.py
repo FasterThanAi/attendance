@@ -49,6 +49,14 @@ class Settings(BaseSettings):
     # --- biometric data retention (non-negotiable rule #5) ---
     biometric_retention_days: int = Field(default=180, ge=1)
 
+    # --- ML models (InsightFace) ---
+    # Directory containing the downloaded .onnx model files (det_10g.onnx,
+    # the recognition model -- see embed.py's ASSUMPTION docstring for the
+    # exact filename to verify). insightface downloads here on first use if
+    # nothing is already present; Phase 9 bakes these into the worker image
+    # instead of downloading at deploy time.
+    insightface_home: str = Field(default="/opt/models/insightface")
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"

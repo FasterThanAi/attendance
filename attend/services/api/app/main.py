@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 
 from app.config import settings
 from app.logging_config import configure_logging, request_id_ctx
-from app.routers import health
+from app.routers import enrollment, health
 from app.schemas.errors import ErrorResponse
 from app.services.consent import ConsentError
 
@@ -47,3 +47,4 @@ async def consent_error_handler(request: Request, exc: ConsentError) -> JSONResp
 
 
 app.include_router(health.router)
+app.include_router(enrollment.router)

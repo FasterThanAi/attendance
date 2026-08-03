@@ -164,6 +164,21 @@ class Student(Base):
     admission_year: Mapped[int] = mapped_column(Integer, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
+    # --- Phase 1 addition: cached gallery mean vector ---
+    # Not in the roadmap's original Phase 0 schema listing, added here because
+    # Phase 1 deliverable 4 explicitly asks for "a cached per-student mean
+    # vector... recomputed on enrollment change. This is what matching will
+    # use" -- and a nullable column on `student` is simpler than a separate
+    # one-row-per-student table for a single cached value. Biometric data
+    # (rule 5): derived directly from face embeddings, so it's covered by the
+    # same "own retention clock" thinking as gallery_embedding, but since it's
+    # a cache (trivially recomputable from gallery_embedding rows, which do
+    # carry their own retention_expires_at), it doesn't need its own -- when
+    # the underlying embeddings expire and are deleted, this cache must be
+    # recomputed (or cleared) as part of that same deletion job (Phase 9).
+    gallery_mean_vector: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    gallery_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     __table_args__ = (
         UniqueConstraint("department_id", "roll_number", name="uq_student_department_roll_number"),
     )
@@ -226,6 +241,12 @@ class GalleryPhoto(Base):
     storage_uri: Mapped[str] = mapped_column(String(1024), nullable=False)
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     quality_score: Mapped[float] = mapped_column(Float, nullable=False)
+
+    # Phase 1 addition (not in the roadmap's original column listing): which
+    # of the three enrollment poses (left/frontal/right) this photo was
+    # bucketed into. Needed so GET /students/{id}/enrollment can report pose
+    # coverage (Phase 1 deliverable 5) without re-running pose estimation.
+    pose_bucket: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
 
 class GalleryEmbedding(Base):

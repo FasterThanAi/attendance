@@ -1,11 +1,27 @@
-# Phase 0: just enough to run an RQ worker process and connect to Redis/Postgres.
-# ML dependencies (insightface, onnxruntime, opencv-python-headless, scikit-learn)
-# are added in Phase 3-5 when the pipeline stages are implemented -- pinning them
-# now with no code using them yet would just slow down every rebuild.
+# Phase 1 update: turns out enrollment (this phase) already needs the ML
+# stack -- embedding a face doesn't wait for Phase 3. The original Phase 0
+# comment here ("ML deps added in Phase 3-5") assumed detection/embedding
+# were needed only for classroom video; enrollment needs them immediately.
 redis==5.0.8
 rq==1.16.2
-sqlalchemy[asyncio]==2.0.35
-asyncpg==0.29.0
 pydantic==2.9.2
 pydantic-settings==2.5.2
 boto3==1.35.24
+
+# Sync DB access (NOT the api service's async SQLAlchemy). RQ jobs are plain
+# sync Python functions by default; running an async engine inside them means
+# wrapping every job in asyncio.run(), which buys nothing here and adds a
+# failure mode (nested event loops) for no benefit. See services/worker/db.py
+# for why this reflects tables from the live DB rather than importing
+# services/api/app/db/models.py -- they're separate Docker images/dependency
+# sets, so importing across them isn't possible without publishing an
+# internal shared package, which is overkill at this project's size.
+sqlalchemy==2.0.35
+psycopg2-binary==2.9.9
+
+# ML stack
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
+onnxruntime==1.19.2
+insightface==0.7.3
+scikit-learn==1.5.2
