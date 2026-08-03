@@ -164,6 +164,8 @@ def enroll_student(
     processing runs at all -- not just before the DB writes at the end.
     """
     params = params or PipelineParams()
+    video_path = Path(video_path)
+    work_dir = Path(work_dir)
     engine = get_engine()
 
     with engine.begin() as conn:

@@ -37,18 +37,21 @@ class EmbedModel:
 _embed_singleton: EmbedModel | None = None
 
 
-def load_model(model_dir: Path, ctx_id: int = -1) -> EmbedModel:
-    """Load the ArcFace recognition model once per process and cache it.
-
-    Loading it per call (e.g. inside a loop over crops) is the single most
-    common way to make this stage catastrophically slow -- see the
-    Phase 1 prompt's warning about this exact mistake.
-    """
+def load_model(model_dir: Path | None = None, ctx_id: int = -1) -> EmbedModel:
     global _embed_singleton
     if _embed_singleton is not None:
         return _embed_singleton
 
     from insightface.model_zoo import model_zoo
+
+    if model_dir is None or not (model_dir / RECOGNITION_MODEL_FILENAME).exists():
+        default_dir = Path.home() / ".insightface" / "models" / "buffalo_l"
+        if (default_dir / RECOGNITION_MODEL_FILENAME).exists():
+            model_dir = default_dir
+        elif model_dir is not None:
+            raise FileNotFoundError(f"{RECOGNITION_MODEL_FILENAME} not found in {model_dir} or {default_dir}")
+        else:
+            raise FileNotFoundError(f"{RECOGNITION_MODEL_FILENAME} not found in {default_dir}")
 
     raw_model = model_zoo.get_model(str(model_dir / RECOGNITION_MODEL_FILENAME))
     raw_model.prepare(ctx_id=ctx_id)
@@ -78,7 +81,11 @@ def embed_batch(model: EmbedModel, aligned: np.ndarray) -> np.ndarray:
     if aligned.ndim != 4 or aligned.shape[1:] != (112, 112, 3):
         raise ValueError(f"expected (N, 112, 112, 3) uint8 BGR, got shape {aligned.shape}")
 
-    raw_embeddings = model.raw.get_feat(aligned)
+    try:
+        crops = [aligned[i] for i in range(aligned.shape[0])]
+        raw_embeddings = model.raw.get_feat(crops)
+    except AttributeError:
+        raw_embeddings = model.raw.get_feat(aligned)
     embeddings = np.asarray(raw_embeddings, dtype=np.float32)
     if embeddings.shape[1] != EMBEDDING_DIM:
         raise ValueError(f"expected {EMBEDDING_DIM}-dim embeddings, model returned shape {embeddings.shape}")

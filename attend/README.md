@@ -6,8 +6,10 @@ an enrolled student gallery, and produces a draft attendance list for the
 teacher to confirm. See `Attend-Classroom-Video-Attendance-Roadmap.pdf` (in
 the parent folder) for the full 11-phase engineering plan this repo follows.
 
-This repo currently implements **Phase 0 (Foundations and consent)** and
-**Phase 1 (Enrollment and gallery construction)**.
+This repo currently implements **Phase 0 (Foundations and consent)**,
+**Phase 1 (Enrollment and gallery construction)**,
+**Phase 2 (Upload and orchestration)**, and
+**Phase 3 (Frames and detection)**.
 
 ## What's here
 
@@ -29,11 +31,17 @@ attend/
     pipeline/
       params.py            PipelineParams -- every tunable, one place
       extract.py           ffmpeg frame sampling
-      detect.py            SCRFD face detection (non-tiled; Phase 3 adds tiling)
+      detect.py            SCRFD face detection: Phase 1's non-tiled path,
+                            plus Phase 3's tiled path (compute_tile_grid,
+                            non_max_suppression, detect_faces_tiled,
+                            detect_all_frames -> detections.parquet)
       align.py              5-point ArcFace alignment to 112x112
       quality.py            blur/brightness/yaw/pitch (Phase 1 subset; Phase 4
                             adds the full tunable-weight composite gate)
       embed.py              ArcFace r100 embedding via onnxruntime
+      run.py                orchestrator -- extract/detect are now REAL
+                            (Phase 3); quality/align/embed/cluster/match
+                            still stubs (Phases 4-6)
       cluster.py, match.py  still stubs (Phases 5-6)
     db.py                  worker's own sync DB access (reflects tables live --
                           see its docstring for why this isn't shared with api)
@@ -47,6 +55,9 @@ attend/
     gallery_sanity.py      run this after enrolling students -- checks whether
                           your enrollment data can work at all before you
                           build anything else on top of it
+    draw_detections.py     Phase 3: draws detection boxes + face_width_px
+                          onto sampled frames from a job's detections.parquet,
+                          so you can eyeball tiling/NMS/coverage
 ```
 
 ## How to verify (Mac)
@@ -137,31 +148,163 @@ curl http://localhost:8000/students/1/enrollment          # check status after a
 python eval/scripts/gallery_sanity.py                       # after a few students are enrolled
 ```
 
-## Two things to verify/fix on your Mac that I could not check
+## Phase 1 status: verified on real hardware
 
-1. **`services/worker/pipeline/embed.py`'s model filename.** I set
-   `RECOGNITION_MODEL_FILENAME = "w600k_r50.onnx"` based on my best
-   recollection of insightface's `buffalo_l` model pack, but the roadmap
-   calls it "ArcFace r100" -- these two details don't necessarily match in
-   every insightface release, and I had no network access to check. The
-   first time `load_model()` runs, insightface auto-downloads the pack to
-   `~/.insightface/models/buffalo_l/` (or wherever `INSIGHTFACE_HOME`
-   points) -- look at what `.onnx` files actually land there and fix the
-   constant if it's not `w600k_r50.onnx`. One-line fix.
-2. **`services/worker/pipeline/quality.py`'s yaw/pitch degree scale.** The
-   roadmap describes the *geometry* ("horizontal offset of the nose relative
-   to eye midpoint, normalised by inter-ocular distance") but not the
-   ratio-to-degrees conversion factor. I used 65 degrees per full
-   inter-ocular-distance offset as a first guess, flagged clearly in that
-   file's docstring. If pose bucketing looks wrong once you have real
-   enrollment videos (e.g. everyone lands in "frontal" even when clearly
-   turned), this constant is the first thing to adjust -- Phase 7's
-   threshold calibration is where you'd normally tune this against labelled
-   data, but nothing stops you from eyeballing it sooner.
+Confirmed on your Mac: insightface buffalo_l loads in Docker, a real 5s
+enrollment video produced 8 embeddings across 3 poses (3/3/2), and
+`gallery_sanity.py` showed 0.804 within-student similarity (target: >0.6),
+with all worker tests passing. Both flagged unknowns turned out to be real
+and were fixed: the recognition `get_feat` call needed a list of crops
+rather than a batched array, and both model-loader functions needed a
+fallback to insightface's actual default download path.
 
-## Next: Phase 2
+## Phase 2: what's new
 
-Upload and orchestration: resumable chunked upload for the (much larger) 4K
-classroom video, and the real job orchestrator in
-`services/worker/pipeline/run.py` with per-stage artifact caching. Say
-"start phase 2" when Phase 1 is verified on your machine.
+- `POST/GET /sessions` -- minimal class-session creation. Not an explicit
+  roadmap deliverable; added because upload needs a real `class_session_id`
+  to attach to and nothing before this point created one.
+- `POST /uploads`, `PUT /uploads/{id}/chunks/{n}`, `GET /uploads/{id}`,
+  `POST /uploads/{id}/complete` -- resumable 5MB chunked upload. Chunk state
+  lives on disk under `/data/jobs/uploads/{upload_id}/`, not in the DB.
+  `/complete` assembles, validates with ffprobe (duration 20s-5min, shorter
+  side >=1080px), creates the `video_upload` row, then runs the pre-flight
+  check.
+- `services/worker/pipeline/preflight.py` -- sharpness, backlighting, pan
+  detection/speed, face yield, coverage, on 18 evenly-sampled frames. Runs as
+  a worker RQ job that the api polls synchronously for up to 28 seconds, so
+  ML code stays out of the api image but the teacher still gets an answer
+  before leaving the classroom.
+- `services/worker/pipeline/run.py` -- `process_session(job_id)`, the real
+  orchestrator. Stages (`extract, detect, quality, align, embed, cluster,
+  match`) are stubs per the Phase 2 spec (logging + an empty manifest);
+  Phases 3-6 fill them in one at a time. The manifest/invalidation logic is
+  real: each stage's cache key is a hash chained from its own relevant
+  params plus every upstream stage's hash, so changing e.g. `match_threshold`
+  only invalidates `match` (not `extract` through `embed`), while changing
+  `detector_score_min` invalidates `detect` onward.
+- `POST /sessions/{id}/process`, `GET /jobs/{id}` -- enqueue + status.
+- `apps/web` -- Next.js 14 App Router scaffold with a working `/record`
+  upload flow: 5MB chunking, exponential backoff per chunk, and resume via
+  `localStorage` (keyed by filename+size+lastModified) so re-selecting the
+  same file after closing the tab picks up from the server's reported
+  progress instead of restarting.
+
+## Phase 2: how to verify
+
+```bash
+docker-compose exec api alembic upgrade head   # no new migration this phase, just confirming current
+docker-compose up --build                       # api gained ffmpeg + rq; worker unchanged deps
+
+docker-compose exec worker pytest -v            # test_run.py: invalidation cascade, skip-if-complete
+docker-compose exec api pytest -v               # test_upload_service.py: chunk idempotency, resume, missing-chunk rejection
+```
+
+I ran both of these test suites' underlying logic manually against the real
+code in my sandbox (stubbing out sqlalchemy/pydantic import-time
+dependencies, since neither installs here) and confirmed correct behavior:
+the hash-chaining cascade genuinely only invalidates a changed stage and
+whatever comes after it, and the chunked-upload service correctly reports
+partial progress and rejects missing chunks. What I could NOT verify: any
+of this running through actual HTTP requests, a real Postgres, real RQ
+workers picking up jobs, or the frontend actually compiling (no npm registry
+access here either -- see `apps/web/README.md`).
+
+Try the real end-to-end flow:
+
+```bash
+# create a session (need an existing course_id/teacher_id from your DB)
+curl -X POST http://localhost:8000/sessions -H "Content-Type: application/json" \
+  -d '{"course_id": 1, "teacher_id": 1, "scheduled_at": "2026-08-04T09:00:00Z", "room": "204"}'
+
+cd apps/web && npm install && cp .env.local.example .env.local && npm run dev
+# open http://localhost:3000/record, set the session id, upload a video
+```
+
+## Phase 3: what's new
+
+- `pipeline/params.py` -- 4 new tiling fields: `tile_trigger_long_side_px`
+  (2000), `tile_size_px` (1280), `tile_overlap_px` (256),
+  `nms_iou_threshold` (0.4). Added to `run.py`'s `STAGE_PARAM_FIELDS["detect"]`
+  and api's `DEFAULT_PIPELINE_PARAMS` too -- verified programmatically that
+  the two stay in sync (see "How to verify" below).
+- `pipeline/detect.py` -- the actual tiled-detection deliverable:
+  - `compute_tile_grid(width, height, tile_size, overlap)` -- splits a frame
+    into overlapping tiles, with the last tile on each axis pinned to the
+    frame's far edge so there's never an uncovered strip.
+  - `non_max_suppression(detections, iou_threshold)` -- merges duplicate
+    detections of the same face coming from adjacent tiles, or from the tile
+    pass vs. the whole-frame-downscaled pass.
+  - `detect_faces_tiled(image, model, params)` -- the full strategy: if a
+    frame's long side exceeds `tile_trigger_long_side_px`, tile it and detect
+    per-tile at native resolution (mapping tile-local coordinates back to
+    frame space), PLUS one whole-frame pass downscaled to `tile_size_px` (to
+    catch large front-row faces a tile boundary might cut through), then
+    merge everything with NMS. Small frames (enrollment selfies, pre-flight
+    samples) skip tiling entirely.
+  - `detect_all_frames(frame_dir, out_dir, params, model_dir, fps)` -- runs
+    tiled detection over every extracted frame using a
+    `multiprocessing.Pool` (up to 4 workers, one detector load per worker
+    process via an initializer -- loading a fresh ONNX session per frame is
+    "the single most common way to make this stage 10-20x slower than it
+    needs to be"), writes `detections.parquet` (columns: `frame_index`,
+    `frame_timestamp_s`, `det_id`, `x1/y1/x2/y2`, `score`, 10 landmark
+    columns, `face_width_px`).
+- `services/worker/requirements.txt` -- added `pandas`/`pyarrow` for the
+  parquet output.
+- `eval/scripts/draw_detections.py` -- standalone debug script: draws boxes +
+  `face_width_px`/score labels onto a sample of frames from a job's
+  `detections.parquet`, so you can eyeball whether tiling actually found the
+  back row, whether NMS left duplicate boxes on one face, and whether tile
+  seams left gaps.
+- `pipeline/run.py` -- `extract` and `detect` are now REAL stages, not stubs.
+  `process_session` looks up the job's `video_upload.storage_uri` and passes
+  it (plus `settings.insightface_home` as the model directory) into
+  `run_all_stages`, which now raises loudly if either stage needs to run but
+  wasn't given a `video_path`/`model_dir` (rather than silently doing
+  nothing). `quality`, `align`, `embed`, `cluster`, `match` are still stubs.
+
+## Phase 3: how to verify
+
+```bash
+docker-compose exec worker pip install -r requirements.txt  # picks up pandas/pyarrow
+docker-compose up --build
+
+docker-compose exec worker pytest -v tests/test_detect_tiling.py tests/test_run.py
+```
+
+Expected: `test_detect_tiling.py` (tile-grid coverage/overlap, NMS merge
+across a tile boundary, tile-local-to-frame coordinate mapping) and
+`test_run.py` (hash-invalidation cascade, skip-if-complete, plus two new
+guard-clause tests for missing `video_path`/`model_dir`) all pass.
+
+I ran the equivalent logic directly in my sandbox (real numpy/opencv, a fake
+detector standing in for the real SCRFD ONNX model, and stubbed
+sqlalchemy/config/db/pytest modules for `test_run.py`'s imports) and
+confirmed all of it: the tile grid has no gaps and the requested overlap;
+NMS correctly merges two overlapping detections into the higher-scoring one
+and leaves distinct ones alone; a face placed near the far edge of a 3000x1800
+synthetic frame is detected once (tile pass + whole-frame pass merged) with
+its box within a few pixels of ground truth; and `run_all_stages` still only
+invalidates the right stages after a param change, now with the real
+extract/detect calls monkeypatched out. I also confirmed
+`DEFAULT_PIPELINE_PARAMS` (api) and `PipelineParams` (worker) have exactly
+matching field sets.
+
+What I could NOT verify: real SCRFD tiled detection against an actual 4K
+classroom video (no insightface/onnxruntime installed here, and no real
+footage) -- `draw_detections.py` is exactly the tool to eyeball that once you
+run a real upload through Docker. Also unverified: `multiprocessing.Pool`
+behavior under real load (process count, pickling `PipelineParams` across
+worker processes), and the parquet write/read round-trip with real pandas
+(pandas import itself works in my sandbox, but I haven't run
+`detect_all_frames` end-to-end against real frames).
+
+## Next: Phase 4
+
+Quality gate and alignment, wired into `run.py`'s `quality`/`align` stages
+for classroom video (both already exist and are proven correct for
+enrollment's use in Phase 1 -- Phase 4 is about applying them to the
+`detections.parquet` this phase produces, plus building the full
+tunable-weight composite quality score the roadmap describes, beyond
+Phase 1's simpler `simple_quality_score`). Say "start phase 4" when Phase 3
+is verified on your machine.

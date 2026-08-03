@@ -25,3 +25,10 @@ opencv-python-headless==4.10.0.84
 onnxruntime==1.19.2
 insightface==0.7.3
 scikit-learn==1.5.2
+
+# Phase 3: detections.parquet output from detect_all_frames (pipeline/detect.py).
+# Columnar + typed storage for potentially tens of thousands of per-frame
+# detection rows -- far cheaper to read back in Phase 4-6 than a CSV/JSON
+# equivalent, and pandas/pyarrow are the standard combo for this.
+pandas==2.2.3
+pyarrow==17.0.0

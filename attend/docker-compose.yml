@@ -62,6 +62,7 @@ services:
     volumes:
       - ./services/worker:/app
       - job_data:/data
+      - insightface_models:/root/.insightface
     depends_on:
       postgres:
         condition: service_healthy
@@ -71,3 +72,4 @@ services:
 volumes:
   postgres_data:
   job_data:
+  insightface_models:

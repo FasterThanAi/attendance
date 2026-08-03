@@ -26,6 +26,20 @@ class PipelineParams:
     # frames) while giving enough samples to find 3 distinct head poses.
     enrollment_sample_fps: float = 6.0
 
+    # --- tiled detection (Phase 3) ---
+    # A frame is only tiled if its longer side exceeds this -- a 4K frame
+    # (3840x2160) is; enrollment's selfie-video frames and the pre-flight
+    # check's downscaled samples are not, and skip tiling entirely.
+    tile_trigger_long_side_px: int = 2000
+    # 1280px tiles with 256px overlap, per the roadmap's tiled-detection
+    # section verbatim -- overlap exists so a face straddling a tile boundary
+    # is still fully visible in at least one tile.
+    tile_size_px: int = 1280
+    tile_overlap_px: int = 256
+    # IoU above which two detections (from adjacent tiles, or a tile vs. the
+    # whole-frame downscaled pass) are considered the same face and merged.
+    nms_iou_threshold: float = 0.4
+
     # --- detection quality gate ---
     # Below this SCRFD confidence, treat it as noise, not a face.
     detector_score_min: float = 0.60
@@ -83,6 +97,20 @@ class PipelineParams:
     match_threshold: float = 0.38  # cosine similarity, ArcFace r100
     match_margin_min: float = 0.05  # top1 minus top2 (Hungarian assignment)
     uncertain_band: float = 0.08  # below threshold by this much -> review
+
+    # --- pre-flight quality check (Phase 2) ---
+    # ASSUMPTION: these thresholds are a first-pass guess, not calibrated
+    # against real classroom footage -- I have no real 4K pan video to test
+    # against in this environment. Expect to retune all of these once you've
+    # run a few real uploads through it and can see which checks fire
+    # correctly vs. which cry wolf (or miss something obvious).
+    preflight_sample_count: int = 18  # frames sampled, evenly spaced across the video
+    preflight_sharpness_min: float = 60.0  # whole-frame Laplacian variance (looser than per-crop blur_laplacian_min)
+    preflight_backlight_luminance_ratio_max: float = 1.8  # upper-third mean / face-region mean luminance
+    preflight_min_pan_range_fraction: float = 0.25  # (max-min mean detection x) / frame width, else "didn't pan"
+    preflight_max_pan_speed_px_per_sec: float = 400.0  # else "panned too fast" -> motion blur
+    preflight_min_face_yield_ratio: float = 0.15  # (mean detections per frame) / expected_students, else "too few faces"
+    preflight_min_coverage_fraction: float = 0.6  # same x-range metric as pan range, used for the "missed part of room" check
 
     def to_json_dict(self) -> dict:
         """What gets stored on processing_job.params_json (see models.py)."""

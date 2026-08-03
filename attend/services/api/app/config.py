@@ -57,6 +57,9 @@ class Settings(BaseSettings):
     # instead of downloading at deploy time.
     insightface_home: str = Field(default="/opt/models/insightface")
 
+    # --- CORS ---
+    cors_allowed_origins: str = Field(default="http://localhost:3000")
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"

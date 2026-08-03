@@ -54,7 +54,7 @@ def _metadata() -> MetaData:
     metadata = MetaData()
     metadata.reflect(
         bind=get_engine(),
-        only=["consent", "student", "gallery_photo", "gallery_embedding"],
+        only=["consent", "student", "gallery_photo", "gallery_embedding", "processing_job", "video_upload"],
     )
     return metadata
 

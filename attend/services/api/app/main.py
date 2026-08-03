@@ -10,11 +10,12 @@ import logging
 import uuid
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import settings
 from app.logging_config import configure_logging, request_id_ctx
-from app.routers import enrollment, health
+from app.routers import enrollment, health, job, session, upload
 from app.schemas.errors import ErrorResponse
 from app.services.consent import ConsentError
 
@@ -22,6 +23,18 @@ configure_logging()
 logger = logging.getLogger("attend.api")
 
 app = FastAPI(title=settings.app_name, version=settings.app_version)
+
+origins = [origin.strip() for origin in settings.cors_allowed_origins.split(",") if origin.strip()]
+if not origins:
+    origins = ["http://localhost:3000"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.middleware("http")
@@ -48,3 +61,6 @@ async def consent_error_handler(request: Request, exc: ConsentError) -> JSONResp
 
 app.include_router(health.router)
 app.include_router(enrollment.router)
+app.include_router(session.router)
+app.include_router(upload.router)
+app.include_router(job.router)
